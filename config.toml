@@ -1,0 +1,59 @@
+# config.toml
+
+devnet = true
+rpc_url = "[https://api.devnet.solana.com](https://api.devnet.solana.com)"
+private_key = "YOUR_WALLET_PRIVATE_KEY_BASE58"  # Замените на ваш ключ
+min_profit_threshold = 0.001  # 0.1% минимальная прибыль
+max_slippage = 0.05          # 5% максимальный слиппадж
+
+# ВАШИ СУЩЕСТВУЮЩИЕ ПУЛЫ
+[[pools]]
+address = "7BPcfDdii2UibJTMibrtdnnSwzSAVKat4nQob4BfJgAX"
+token_a = "7oa4krfxjocDH47RymzbPW4QHVV4Ec4vuAQj1gYAn3SQ"  # TOKEN_A
+token_b = "4PvUes3azNmTSohsrSBBDTFZqVQqM5oCkdF1vZDpPoZS"  # TOKEN_B
+pool_type = "CPMM"
+
+[[pools]]
+address = "DWqCNoxn1xN1tiaXK1LQwZaWtnozijW7rdkdHc55qjuL"
+token_a = "7oa4krfxjocDH47RymzbPW4QHVV4Ec4vuAQj1gYAn3SQ"  # TOKEN_A
+token_b = "4PvUes3azNmTSohsrSBBDTFZqVQqM5oCkdF1vZDpPoZS"  # TOKEN_B
+pool_type = "CLMM"
+
+[[pools]]
+address = "EEkKpz3avsGAptVyrxjHxFHPHc8zmoGcGyWJG6b1B2Pp"
+token_a = "4PvUes3azNmTSohsrSBBDTFZqVQqM5oCkdF1vZDpPoZS"  # TOKEN_B
+token_b = "ExAMh7G7BRG5qVLFJySeedkCPh39ywpVBNFMAM5rmpdc"  # TOKEN_C
+pool_type = "CLMM"
+
+[[pools]]
+address = "uF1h7WsKs5XRCUjLmSK7jd3i5TQcr4HCAG1zqNweioz"
+token_a = "7oa4krfxjocDH47RymzbPW4QHVV4Ec4vuAQj1gYAn3SQ"  # TOKEN_A
+token_b = "ExAMh7G7BRG5qVLFJySeedkCPh39ywpVBNFMAM5rmpdc"  # TOKEN_C
+pool_type = "CPMM"
+
+[[pools]]
+address = "8Zy45DRxTxMt4qGJDJ3g6gTQZTyxJcsJBUHfWag5aGek"
+token_a = "So11111111111111111111111111111111111111112"    # SOL (wrapped)
+token_b = "7oa4krfxjocDH47RymzbPW4QHVV4Ec4vuAQj1gYAn3SQ"  # TOKEN_A
+pool_type = "CLMM"
+
+# МЕТАДАННЫЕ ТОКЕНОВ
+[[tokens]]
+mint = "7oa4krfxjocDH47RymzbPW4QHVV4Ec4vuAQj1gYAn3SQ"
+symbol = "TOKEN_A"
+decimals = 9
+
+[[tokens]]
+mint = "4PvUes3azNmTSohsrSBBDTFZqVQqM5oCkdF1vZDpPoZS"
+symbol = "TOKEN_B"
+decimals = 9
+
+[[tokens]]
+mint = "ExAMh7G7BRG5qVLFJySeedkCPh39ywpVBNFMAM5rmpdc"
+symbol = "TOKEN_C"
+decimals = 9
+
+[[tokens]]
+mint = "So11111111111111111111111111111111111111112"
+symbol = "SOL"
+decimals = 9

@@ -1,0 +1,51 @@
+# bot/Cargo.toml
+[package]
+name = "arbitrage-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arbitrage-executor = { path = "../programs/arbitrage-executor" }
+
+solana-program = { workspace = true }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-transaction-status = { workspace = true }
+solana-program-pack = { workspace = true }
+
+anchor-client = { workspace = true }
+anchor-spl = { workspace = true }
+borsh = { workspace = true }
+anchor-lang = { workspace = true }
+solana-system-interface = { version = "2.0.0" }
+
+tokio = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+reqwest = { workspace = true }
+dotenv = "0.15"
+
+
+bs58 = { workspace = true }
+rayon = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+shellexpand = { workspace = true }
+once_cell = { workspace = true }
+lru = { workspace = true }
+
+
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }
+bytemuck = { version = "1.14", features = ["derive"] }
+log = "0.4.28"

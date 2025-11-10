@@ -1,0 +1,4854 @@
+--- File: /home/newvovi5/arbitrage-bot-rust/debug-pool-structure.js ---
+// debug-pool-structure.js
+const { Connection, PublicKey } = require('@solana/web3.js');
+
+const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+
+async function debugPoolStructure() {
+    console.log('🔍 Анализ структуры пулов Raydium AMM V4...');
+
+    const RAYDIUM_AMM = new PublicKey('DRaya7Kj3aMWQSy19kSjvmuwq9docCHofyP9kanQGaav');
+
+    try {
+        const accounts = await connection.getProgramAccounts(RAYDIUM_AMM, {
+            filters: [{ dataSize: 752 }],
+            dataSlice: { offset: 0, length: 100 } // Берем только первые 100 байт для анализа
+        });
+
+        console.log(`📊 Найдено ${accounts.length} пулов размером 752 байта`);
+
+        if (accounts.length > 0) {
+            const firstPool = accounts[0];
+            console.log('🎯 Анализ первого пула:', firstPool.pubkey.toString());
+            console.log('📁 Размер данных:', firstPool.account.data.length);
+
+            // Выводим hex-dump первых 100 байт
+            const hex = Buffer.from(firstPool.account.data).toString('hex');
+            console.log('🔍 Первые 100 байт (hex):');
+            for (let i = 0; i < Math.min(hex.length, 200); i += 64) {
+                const offset = i / 2;
+                const chunk = hex.substr(i, 64);
+                console.log(`  ${offset.toString().padStart(3, '0')}: ${chunk}`);
+            }
+        }
+
+        // Проверим также полный размер
+        const fullAccounts = await connection.getProgramAccounts(RAYDIUM_AMM, {
+            filters: [] // Без фильтров размера
+        });
+
+        if (fullAccounts.length > 0) {
+            const sizes = fullAccounts.map(acc => acc.account.data.length);
+            const uniqueSizes = [...new Set(sizes)].sort((a, b) => a - b);
+
+            console.log('\n📐 Найденные размеры аккаунтов:');
+            uniqueSizes.forEach(size => {
+                const count = sizes.filter(s => s === size).length;
+                console.log(`  ${size} байт: ${count} аккаунтов`);
+            });
+        }
+
+    } catch (error) {
+        console.error('❌ Ошибка:', error);
+    }
+}
+
+debugPoolStructure();
+--- End File: /home/newvovi5/arbitrage-bot-rust/debug-pool-structure.js ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/.cargo/config.toml ---
+# .cargo/config.toml
+[build]
+rustflags = [
+    "-A", "dead_code",
+    "-A", "unused_imports",
+    "-A", "unused_variables",
+    "-A", "unexpected_cfgs"
+]
+--- End File: /home/newvovi5/arbitrage-bot-rust/.cargo/config.toml ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/raydium_clmm.rs ---
+// bot/src/scanner/raydium_clmm.rs
+use anyhow::{Result, Context};
+use rayon::prelude::*;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+use solana_client::rpc_filter::{RpcFilterType, Memcmp, MemcmpEncodedBytes};
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use crate::config::BotConfig;
+use crate::types::{PoolState, DexProtocol};
+use super::DexScanner;
+
+#[derive(Clone)]
+pub struct RaydiumClmmScanner {
+    rpc_client: Arc<RpcClient>,
+    config: Arc<BotConfig>,
+    program_id: Pubkey,
+}
+
+// Упрощенная CLMM структура для парсинга ключевых полей
+#[derive(Debug)]
+struct ClmmPoolInfo {
+    token_mint_0: Pubkey,
+    token_mint_1: Pubkey,
+    token_vault_0: Pubkey,
+    token_vault_1: Pubkey,
+    tick_spacing: u16,
+    liquidity: u128,
+}
+
+impl ClmmPoolInfo {
+    /// Парсинг CLMM pool из сырых данных (упрощенная версия)
+    fn try_from_slice(data: &[u8]) -> Result<Self> {
+        if data.len() < 400 {
+            return Err(anyhow::anyhow!("Недостаточно данных для CLMM pool"));
+        }
+
+        // Примерные офсеты для CLMM (нужно уточнить по IDL)
+        let token_mint_0 = crate::dex_structs::read_pubkey(data, 72)?;
+        let token_mint_1 = crate::dex_structs::read_pubkey(data, 104)?;
+        let token_vault_0 = crate::dex_structs::read_pubkey(data, 136)?;
+        let token_vault_1 = crate::dex_structs::read_pubkey(data, 168)?;
+        let tick_spacing = u16::from_le_bytes([data[200], data[201]]);
+        let liquidity = u128::from_le_bytes(
+            data[300..316].try_into().unwrap_or([0u8; 16])
+        );
+
+        Ok(Self {
+            token_mint_0,
+            token_mint_1,
+            token_vault_0,
+            token_vault_1,
+            tick_spacing,
+            liquidity,
+        })
+    }
+}
+
+impl RaydiumClmmScanner {
+    pub fn new(config: Arc<BotConfig>, rpc_client: Arc<RpcClient>) -> Result<Self> {
+        let program_id = config.dex.raydium_clmm.to_pubkey()
+            .context("Некорректный Raydium CLMM program ID")?;
+
+        info!("🌊 Инициализация Raydium CLMM сканера с program_id: {}", program_id);
+
+        Ok(Self {
+            rpc_client,
+            config,
+            program_id,
+        })
+    }
+
+    fn parse_clmm_pool(&self, pool_id: Pubkey, data: &[u8]) -> Result<PoolState> {
+        let pool_info = ClmmPoolInfo::try_from_slice(data)?;
+
+        Ok(PoolState {
+            id: pool_id,
+            protocol: DexProtocol::RaydiumClmm,
+            token_a: pool_info.token_mint_0,
+            token_b: pool_info.token_mint_1,
+            reserve_a: 0, // Будет получено из vault'ов
+            reserve_b: 0,
+            fee_bps: 30, // Типичная комиссия CLMM (0.3%)
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: data.to_vec(),
+            decimals_a: 9,
+            decimals_b: 9,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl DexScanner for RaydiumClmmScanner {
+    fn protocol(&self) -> DexProtocol {
+        DexProtocol::RaydiumClmm
+    }
+
+    async fn scan_pools(&self) -> Result<Vec<PoolState>> {
+        info!("📡 Сканирование Raydium CLMM пулов...");
+
+        // Фильтры для поиска CLMM пулов
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![
+                RpcFilterType::DataSize(1544), // Размер CLMM pool account
+            ]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                data_slice: None,
+                min_context_slot: None,
+            },
+            with_context: None,
+            sort_results: None,
+        };
+
+        let accounts = self.rpc_client
+            .get_program_accounts_with_config(&self.program_id, config)
+            .context("Ошибка получения CLMM аккаунтов")?;
+
+        info!("   📊 Найдено {} потенциальных CLMM пулов", accounts.len());
+
+        // Параллельный парсинг
+        let pools: Vec<PoolState> = accounts
+            .par_iter()
+            .filter_map(|(pubkey, account)| {
+                match self.parse_clmm_pool(*pubkey, &account.data) {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        warn!("⚠️ Не удалось распарсить CLMM пул {}: {}", pubkey, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        info!("✅ Raydium CLMM: найдено {} пулов", pools.len());
+        Ok(pools)
+    }
+
+    fn clone_box(&self) -> Box<dyn DexScanner> {
+        Box::new(self.clone())
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/raydium_clmm.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/pool_monitor.rs ---
+// bot/src/scanner/pool_monitor.rs
+// Мониторинг изменений в пулах в реальном времени
+
+// use anyhow::Result;
+use dashmap::DashMap;
+use solana_sdk::pubkey::Pubkey;
+use std::sync::Arc;
+use tokio::time::{interval, Duration};
+use tracing::{info, debug};
+
+use crate::types::PoolState;
+
+/// Кэш состояний пулов с автообновлением
+pub struct PoolMonitor {
+    /// Кэш пулов: pool_id -> PoolState
+    cache: Arc<DashMap<Pubkey, PoolState>>,
+
+    /// Интервал обновления в миллисекундах
+    update_interval_ms: u64,
+}
+
+impl PoolMonitor {
+    pub fn new(update_interval_ms: u64) -> Self {
+        Self {
+            cache: Arc::new(DashMap::new()),
+            update_interval_ms,
+        }
+    }
+
+    /// Обновление состояния пула
+    pub fn update_pool(&self, pool: PoolState) {
+        let pool_id = pool.id;
+
+        // Проверяем значительность изменения
+        if let Some(old_pool) = self.cache.get(&pool_id) {
+            let price_change = self.calculate_price_change(&old_pool, &pool);
+
+            if price_change > 0.5 {
+                debug!("Значительное изменение цены в пуле {}: {:.2}%",
+                       pool_id, price_change);
+            }
+        }
+
+        self.cache.insert(pool_id, pool);
+    }
+
+    /// Получение всех пулов из кэша
+    pub fn get_all_pools(&self) -> Vec<PoolState> {
+        self.cache.iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Получение конкретного пула
+    pub fn get_pool(&self, pool_id: &Pubkey) -> Option<PoolState> {
+        self.cache.get(pool_id).map(|entry| entry.value().clone())
+    }
+
+    /// Количество пулов в кэше
+    pub fn pool_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Расчёт изменения цены в процентах
+    fn calculate_price_change(&self, old: &PoolState, new: &PoolState) -> f64 {
+        let old_price = old.price_a_to_b();
+        let new_price = new.price_a_to_b();
+
+        if old_price == 0.0 {
+            return 0.0;
+        }
+
+        ((new_price - old_price) / old_price).abs() * 100.0
+    }
+
+    /// Очистка устаревших пулов (старше threshold_seconds)
+    pub fn cleanup_stale_pools(&self, threshold_seconds: i64) {
+        let now = chrono::Utc::now().timestamp();
+
+        self.cache.retain(|_pool_id, pool| {
+            let age = now - pool.last_updated;
+            age < threshold_seconds
+        });
+    }
+}
+
+/// Фоновая задача периодической очистки кэша
+pub async fn start_cache_cleanup_task(monitor: Arc<PoolMonitor>) {
+    let mut cleanup_interval = interval(Duration::from_secs(60)); // Каждую минуту
+
+    loop {
+        cleanup_interval.tick().await;
+
+        let count_before = monitor.pool_count();
+        monitor.cleanup_stale_pools(300); // Удаляем старше 5 минут
+        let count_after = monitor.pool_count();
+
+        if count_before != count_after {
+            info!("🧹 Очистка кэша: удалено {} устаревших пулов",
+                  count_before - count_after);
+        }
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/pool_monitor.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/raydium_amm.rs ---
+// bot/src/scanner/raydium_amm.rs
+use anyhow::{Result, Context};
+use rayon::prelude::*;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+use solana_client::rpc_filter::RpcFilterType;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use solana_program_pack::Pack;
+use spl_token::state::Account as TokenAccount;
+use std::sync::Arc;
+use std::collections::HashMap;
+use tracing::{info, warn, debug};
+
+use crate::config::BotConfig;
+use crate::dex_structs::AmmInfo;
+use crate::types::{DexProtocol, PoolState};
+use super::DexScanner;
+
+#[derive(Clone)]
+pub struct RaydiumAmmScanner {
+    rpc_client: Arc<RpcClient>,
+    config: Arc<BotConfig>,
+    program_id: Pubkey,
+}
+
+impl RaydiumAmmScanner {
+    pub fn new(config: Arc<BotConfig>, rpc_client: Arc<RpcClient>) -> Result<Self> {
+        let program_id = config.dex.raydium_amm_v4.to_pubkey()
+            .context("Некорректный Raydium AMM program ID в конфигурации")?;
+
+        info!("🚀 Инициализация Raydium AMM сканера с program_id: {}", program_id);
+
+        Ok(Self {
+            rpc_client,
+            config,
+            program_id,
+        })
+    }
+
+    /// СИНХРОННАЯ функция парсинга для совместимости с rayon
+    fn parse_pool_account_sync(&self, pool_id: Pubkey, data: &[u8]) -> Result<PoolState> {
+        debug!("🔍 Парсинг пула {} (размер данных: {} байт)", pool_id, data.len());
+
+        let amm_info = AmmInfo::try_from_slice(data)
+            .context("Ошибка десериализации AmmInfo")?;
+
+        // ВАЛИДАЦИЯ OpenBook ID
+        let expected_openbook_id = self.config.dex.openbook_id.to_pubkey()
+            .context("Некорректный OpenBook ID в конфигурации")?;
+
+        if amm_info.market_program_id != expected_openbook_id {
+            return Err(anyhow::anyhow!(
+                "Неверный market_program_id: ожидался {}, получен {}",
+                expected_openbook_id,
+                amm_info.market_program_id
+            ));
+        }
+
+        // Создаем PoolState с базовыми данными (резервы будут получены отдельно)
+        Ok(PoolState {
+            id: pool_id,
+            protocol: DexProtocol::RaydiumAmmV4,
+            token_a: amm_info.base_mint,
+            token_b: amm_info.quote_mint,
+            reserve_a: 0, // Будет обновлено в fetch_vault_reserves_batch
+            reserve_b: 0,
+            fee_bps: (amm_info.fees.swap_fee_numerator * 10000 / amm_info.fees.swap_fee_denominator) as u16,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: data.to_vec(),
+            decimals_a: 9, // ДОБАВЛЕНО
+            decimals_b: 9, // ДОБАВЛЕНО
+        })
+    }
+
+    /// ПАКЕТНОЕ получение резервов vault'ов
+    fn fetch_vault_reserves_batch(&self, pools: &mut [PoolState]) -> Result<()> {
+        if pools.is_empty() {
+            return Ok(());
+        }
+
+        // Собираем все уникальные vault адреса
+        let mut vault_keys = Vec::new();
+        let mut pool_vault_map = HashMap::new();
+
+        for (pool_idx, pool) in pools.iter().enumerate() {
+            // Парсим amm_info для получения vault адресов
+            if let Ok(amm_info) = AmmInfo::try_from_slice(&pool.full_state_data) {
+                vault_keys.push(amm_info.base_vault);
+                vault_keys.push(amm_info.quote_vault);
+
+                pool_vault_map.insert(amm_info.base_vault, (pool_idx, true));  // true = base
+                pool_vault_map.insert(amm_info.quote_vault, (pool_idx, false)); // false = quote
+            }
+        }
+
+        // Убираем дубликаты
+        vault_keys.sort();
+        vault_keys.dedup();
+
+        info!("📊 Получение резервов для {} vault'ов", vault_keys.len());
+
+        // ПАКЕТНЫЕ запросы по 100 аккаунтов
+        let vault_accounts = self.get_multiple_accounts_batch(&vault_keys)?;
+
+        // Обновляем резервы в pools
+        for (vault_key, account_opt) in vault_keys.iter().zip(vault_accounts.iter()) {
+            if let (Some(account), Some((pool_idx, is_base))) = (account_opt, pool_vault_map.get(vault_key)) {
+                if let Ok(token_account) = TokenAccount::unpack(&account.data) {
+                    if *is_base {
+                        pools[*pool_idx].reserve_a = token_account.amount;
+                    } else {
+                        pools[*pool_idx].reserve_b = token_account.amount;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Пакетный запрос аккаунтов с разбивкой на чанки по 100
+    fn get_multiple_accounts_batch(&self, keys: &[Pubkey]) -> Result<Vec<Option<solana_sdk::account::Account>>> {
+        const BATCH_SIZE: usize = 100;
+        let mut all_accounts = Vec::with_capacity(keys.len());
+
+        for chunk in keys.chunks(BATCH_SIZE) {
+            let accounts = self.rpc_client.get_multiple_accounts(chunk)?;
+            all_accounts.extend(accounts);
+        }
+
+        Ok(all_accounts)
+    }
+}
+
+#[async_trait::async_trait]
+impl DexScanner for RaydiumAmmScanner {
+    fn protocol(&self) -> DexProtocol {
+        DexProtocol::RaydiumAmmV4
+    }
+
+    async fn scan_pools(&self) -> Result<Vec<PoolState>> {
+        info!("📡 Начинаем параллельное сканирование Raydium AMM V4 пулов...");
+        info!("   🎯 Program ID: {}", self.program_id);
+
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![RpcFilterType::DataSize(752)]), // Размер AmmInfo
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                data_slice: None,
+                min_context_slot: None,
+            },
+            with_context: None,
+            sort_results: None,
+        };
+
+        let accounts = self.rpc_client
+            .get_program_accounts_with_config(&self.program_id, config)
+            .context("Ошибка получения аккаунтов программы")?;
+
+        info!("   📊 Найдено {} потенциальных аккаунтов пулов", accounts.len());
+
+        // ПАРАЛЛЕЛЬНЫЙ парсинг с rayon
+        let mut pools: Vec<PoolState> = accounts
+            .par_iter()
+            .filter_map(|(pubkey, account)| {
+                match self.parse_pool_account_sync(*pubkey, &account.data) {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        debug!("⚠️ Не удалось распарсить пул {}: {}", pubkey, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        info!("✅ Успешно распарсено {} валидных пулов", pools.len());
+
+        // ПАКЕТНОЕ получение резервов
+        if !pools.is_empty() {
+            self.fetch_vault_reserves_batch(&mut pools)?;
+
+            // Фильтруем пулы с нулевыми резервами
+            pools.retain(|pool| pool.reserve_a > 0 && pool.reserve_b > 0);
+
+            info!("💰 Пулов с ненулевыми резервами: {}", pools.len());
+        }
+
+        Ok(pools)
+    }
+
+    fn clone_box(&self) -> Box<dyn DexScanner> {
+        Box::new(self.clone())
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/raydium_amm.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/mod.rs ---
+// bot/src/scanner/mod.rs
+pub mod pool_monitor; // ДОБАВЬТЕ ЭТУ СТРОКУ В НАЧАЛО
+pub mod raydium_amm;
+pub mod raydium_cpmm;
+pub mod raydium_clmm;
+pub mod meteora_dlmm;
+
+use futures::future::join_all;
+use anyhow::Result;
+use async_trait::async_trait;
+use std::sync::Arc;
+use tracing::info;
+use solana_client::rpc_client::RpcClient;
+
+use crate::config::BotConfig;
+use crate::types::{PoolState, DexProtocol};
+
+use raydium_amm::RaydiumAmmScanner;
+use raydium_cpmm::RaydiumCpmmScanner;
+use raydium_clmm::RaydiumClmmScanner;
+use meteora_dlmm::MeteoraDlmmScanner;
+
+#[async_trait]
+pub trait DexScanner: Send + Sync {
+    fn protocol(&self) -> DexProtocol;
+    async fn scan_pools(&self) -> Result<Vec<PoolState>>;
+    fn clone_box(&self) -> Box<dyn DexScanner>;
+}
+
+pub struct MultiDexScanner {
+    scanners: Vec<Box<dyn DexScanner>>,
+    config: Arc<BotConfig>,
+    cached_test_pools: std::sync::Mutex<Option<Vec<PoolState>>>,
+}
+
+impl MultiDexScanner {
+    pub fn new(config: Arc<BotConfig>, rpc_client: Arc<RpcClient>) -> Self {
+        let scanners: Vec<Box<dyn DexScanner>> = vec![
+            Box::new(RaydiumAmmScanner::new(config.clone(), rpc_client.clone()).unwrap()),
+            Box::new(RaydiumCpmmScanner::new(config.clone(), rpc_client.clone()).unwrap()),
+            Box::new(RaydiumClmmScanner::new(config.clone(), rpc_client.clone()).unwrap()),
+            Box::new(MeteoraDlmmScanner::new(config.clone())),
+        ];
+        Self {
+            scanners,
+            config,
+            cached_test_pools: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// НОВЫЙ МЕТОД: Установка тестовых пулов для devnet
+    pub fn set_test_pools(&self, pools: Vec<PoolState>) {
+        let pools_count = pools.len(); // ПОЛУЧАЕМ ДЛИНУ ДО ПЕРЕМЕЩЕНИЯ
+        *self.cached_test_pools.lock().unwrap() = Some(pools);
+        info!("🧪 Установлено {} тестовых пулов для devnet режима", pools_count);
+    }
+
+    pub async fn scan_all_dex(&self) -> Result<Vec<PoolState>> {
+        // ПРОВЕРКА DEVNET РЕЖИМА
+        let is_devnet = self.config.rpc.url.contains("devnet");
+
+        if is_devnet {
+            // В devnet сначала проверяем наличие тестовых пулов
+            if let Some(test_pools) = self.cached_test_pools.lock().unwrap().as_ref() {
+                if !test_pools.is_empty() {
+                    info!("🧪 Devnet режим: используем {} тестовых пулов для арбитража", test_pools.len());
+                    return Ok(test_pools.clone());
+                }
+            }
+        }
+
+        info!("🔍 Запуск {} сканирования всех DEX...",
+              if is_devnet { "ограниченного devnet" } else { "полного mainnet" });
+
+        let scan_futures = self.scanners.iter().map(|scanner| {
+            scanner.scan_pools()
+        });
+
+        let results = join_all(scan_futures).await;
+        let mut all_pools = Vec::new();
+
+        for (i, result) in results.into_iter().enumerate() {
+            let protocol = self.scanners[i].protocol();
+            match result {
+                Ok(mut pools) => {
+                    // DEVNET ОГРАНИЧЕНИЯ
+                    if is_devnet && pools.len() > 100 {
+                        info!("  🧪 Devnet режим: ограничиваем {} пулов до 100", pools.len());
+                        pools.truncate(100);
+                    }
+
+                    info!("  {:?}: найдено {} пулов", protocol, pools.len());
+                    all_pools.extend(pools);
+                }
+                Err(e) => {
+                    tracing::warn!("  {:?}: ошибка сканирования - {}", protocol, e);
+                }
+            }
+        }
+
+        // ДОПОЛНИТЕЛЬНОЕ ОГРАНИЧЕНИЕ ДЛЯ DEVNET
+        if is_devnet && all_pools.len() > 500 {
+            info!("🧪 Devnet режим: итоговое ограничение с {} до 500 пулов", all_pools.len());
+            all_pools.truncate(500);
+        }
+
+        info!("✅ Всего пулов найдено: {}", all_pools.len());
+        Ok(all_pools)
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/mod.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/meteora_dlmm.rs ---
+// bot/src/scanner/meteora_dlmm.rs
+use anyhow::Result;
+use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
+use tracing::{info, warn};
+use std::sync::Arc;
+
+use crate::config::BotConfig;
+use crate::types::{PoolState, DexProtocol};
+use super::DexScanner;
+
+#[derive(Clone)]
+pub struct MeteoraDlmmScanner {
+    config: Arc<BotConfig>,
+}
+
+#[derive(Deserialize)]
+struct MeteoraPair {
+    address: String,
+    mint_x: String,
+    mint_y: String,
+    reserve_x_amount: u64,
+    reserve_y_amount: u64,
+    base_fee_percentage: String,
+}
+
+impl MeteoraDlmmScanner {
+    pub fn new(config: Arc<BotConfig>) -> Self {
+        Self { config }
+    }
+
+    fn convert_api_pool_to_pool_state(&self, api_pool: MeteoraPair) -> Result<PoolState> {
+        let id = Pubkey::from_str(&api_pool.address)?;
+        let token_a = Pubkey::from_str(&api_pool.mint_x)?;
+        let token_b = Pubkey::from_str(&api_pool.mint_y)?;
+
+        let fee_pct: f64 = api_pool.base_fee_percentage.parse()?;
+        let fee_bps = (fee_pct * 100.0) as u16;
+
+        Ok(PoolState {
+            id,
+            protocol: DexProtocol::MeteoraDlmm,
+            token_a,
+            token_b,
+            reserve_a: api_pool.reserve_x_amount,
+            reserve_b: api_pool.reserve_y_amount,
+            fee_bps,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+            decimals_a: 9,
+            decimals_b: 9,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl DexScanner for MeteoraDlmmScanner {
+    fn protocol(&self) -> DexProtocol {
+        DexProtocol::MeteoraDlmm
+    }
+
+    async fn scan_pools(&self) -> Result<Vec<PoolState>> {
+        info!("📡 Сканирование Meteora DLMM пулов через API...");
+
+        // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: добавляем параметр кластера для devnet
+        let api_url = "https://dlmm-api.meteora.ag/pair/all?cluster=devnet";
+
+        let response = reqwest::get(api_url).await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("API Meteora вернуло ошибку: {}", response.status());
+        }
+
+        let api_pools: Vec<MeteoraPair> = response.json().await?;
+
+        info!("   📊 Получено {} пулов от API Meteora (devnet)", api_pools.len());
+
+        let mut pools = Vec::new();
+        for api_pool in api_pools {
+            match self.convert_api_pool_to_pool_state(api_pool) {
+                Ok(pool) => pools.push(pool),
+                Err(e) => warn!("⚠️ Ошибка конвертации пула Meteora: {}", e),
+            }
+        }
+
+        info!("✅ Meteora DLMM: найдено {} валидных пулов", pools.len());
+        Ok(pools)
+    }
+
+    fn clone_box(&self) -> Box<dyn DexScanner> {
+        Box::new(self.clone())
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/meteora_dlmm.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/raydium_cpmm.rs ---
+// bot/src/scanner/raydium_cpmm.rs
+use anyhow::{Result, Context};
+use rayon::prelude::*;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+use solana_client::rpc_filter::RpcFilterType;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use crate::config::BotConfig;
+use crate::types::{PoolState, DexProtocol};
+use super::DexScanner;
+
+#[derive(Clone)]
+pub struct RaydiumCpmmScanner {
+    rpc_client: Arc<RpcClient>,
+    config: Arc<BotConfig>,
+    program_id: Pubkey,
+}
+
+// Упрощенная CPMM структура
+#[derive(Debug)]
+struct CpmmPoolInfo {
+    token_0_mint: Pubkey,
+    token_1_mint: Pubkey,
+    token_0_vault: Pubkey,
+    token_1_vault: Pubkey,
+    lp_supply: u64,
+}
+
+impl CpmmPoolInfo {
+    fn try_from_slice(data: &[u8]) -> Result<Self> {
+        if data.len() < 320 {
+            return Err(anyhow::anyhow!("Недостаточно данных для CPMM pool"));
+        }
+
+        // Упрощенные офсеты для CPMM (нужно уточнить)
+        let token_0_mint = crate::dex_structs::read_pubkey(data, 8)?;
+        let token_1_mint = crate::dex_structs::read_pubkey(data, 40)?;
+        let token_0_vault = crate::dex_structs::read_pubkey(data, 72)?;
+        let token_1_vault = crate::dex_structs::read_pubkey(data, 104)?;
+        let lp_supply = crate::dex_structs::read_u64(data, 200)?;
+
+        Ok(Self {
+            token_0_mint,
+            token_1_mint,
+            token_0_vault,
+            token_1_vault,
+            lp_supply,
+        })
+    }
+}
+
+impl RaydiumCpmmScanner {
+    pub fn new(config: Arc<BotConfig>, rpc_client: Arc<RpcClient>) -> Result<Self> {
+        let program_id = config.dex.raydium_cpmm.to_pubkey()
+            .context("Некорректный Raydium CPMM program ID")?;
+
+        info!("🔄 Инициализация Raydium CPMM сканера с program_id: {}", program_id);
+
+        Ok(Self {
+            rpc_client,
+            config,
+            program_id,
+        })
+    }
+
+    fn parse_cpmm_pool(&self, pool_id: Pubkey, data: &[u8]) -> Result<PoolState> {
+        let pool_info = CpmmPoolInfo::try_from_slice(data)?;
+
+        Ok(PoolState {
+            id: pool_id,
+            protocol: DexProtocol::RaydiumCpmm,
+            token_a: pool_info.token_0_mint,
+            token_b: pool_info.token_1_mint,
+            reserve_a: 0,
+            reserve_b: 0,
+            fee_bps: 25, // Типичная комиссия CPMM (0.25%)
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: data.to_vec(),
+            decimals_a: 9,
+            decimals_b: 9,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl DexScanner for RaydiumCpmmScanner {
+    fn protocol(&self) -> DexProtocol {
+        DexProtocol::RaydiumCpmm
+    }
+
+    async fn scan_pools(&self) -> Result<Vec<PoolState>> {
+        info!("📡 Сканирование Raydium CPMM пулов...");
+
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![
+                RpcFilterType::DataSize(324), // Размер CPMM pool account
+            ]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                data_slice: None,
+                min_context_slot: None,
+            },
+            with_context: None,
+            sort_results: None,
+        };
+
+        let accounts = self.rpc_client
+            .get_program_accounts_with_config(&self.program_id, config)
+            .context("Ошибка получения CPMM аккаунтов")?;
+
+        info!("   📊 Найдено {} потенциальных CPMM пулов", accounts.len());
+
+        let pools: Vec<PoolState> = accounts
+            .par_iter()
+            .filter_map(|(pubkey, account)| {
+                match self.parse_cpmm_pool(*pubkey, &account.data) {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        warn!("⚠️ Не удалось распарсить CPMM пул {}: {}", pubkey, e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        info!("✅ Raydium CPMM: найдено {} пулов", pools.len());
+        Ok(pools)
+    }
+
+    fn clone_box(&self) -> Box<dyn DexScanner> {
+        Box::new(self.clone())
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/scanner/raydium_cpmm.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/main.rs ---
+// bot/src/main.rs
+// Точка входа арбитражного бота
+
+mod config;
+mod types;
+mod scanner;
+mod arbitrage;
+mod executor;
+mod utils;
+mod test_setup;
+pub mod dex_structs;
+
+use solana_sdk::signature::Signer;
+use anyhow::Result;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
+use std::sync::Arc;
+use tokio::time::{interval, Duration};
+use tracing::{info, error, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use config::BotConfig;
+use scanner::{MultiDexScanner, pool_monitor::PoolMonitor};
+use arbitrage::ArbitrageFinder;
+use executor::TransactionExecutor;
+use utils::load_keypair_from_file;
+use test_setup::TestEnvironmentSetup;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Инициализация логирования
+    init_logging();
+
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║    SOLANA ARBITRAGE BOT - RUST EDITION (DEVNET)               ║");
+    println!("║    Высокопроизводительный поиск и исполнение арбитража        ║");
+    println!("╚════════════════════════════════════════════════════════════════╝\n");
+
+    // Загрузка конфигурации
+    info!("📋 Загрузка конфигурации...");
+    let config = Arc::new(BotConfig::load()?);
+    info!("✅ Конфигурация загружена");
+
+    // Загрузка кошелька
+    info!("🔑 Загрузка кошелька...");
+    let wallet_path = config.wallet.path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("Неверный путь к кошельку"))?;
+    let keypair = Arc::new(load_keypair_from_file(wallet_path)?);
+    info!("   Публичный ключ: {}", keypair.pubkey());
+
+    // Инициализация RPC клиента
+    info!("🌐 Подключение к Solana RPC...");
+    let rpc_client = Arc::new(RpcClient::new_with_commitment(
+        config.rpc.url.clone(),
+        CommitmentConfig::confirmed(),
+    ));
+
+    // Проверка подключения
+    let cluster_version = rpc_client.get_version()?;
+    info!("   Подключено к кластеру: {} (Solana {})",
+          config.rpc.url, cluster_version.solana_core);
+
+    // Проверка баланса
+    let balance = rpc_client.get_balance(&keypair.pubkey())?;
+    let balance_sol = balance as f64 / 1_000_000_000.0;
+    info!("💰 Баланс кошелька: {:.9} SOL", balance_sol);
+
+    if balance_sol < 0.1 {
+        warn!("⚠️  НИЗКИЙ БАЛАНС! Пополните через фоссет: https://faucet.solana.com/");
+        warn!("   Адрес: {}", keypair.pubkey());
+    }
+
+    // Инициализация компонентов
+    info!("🔧 Инициализация компонентов бота...");
+
+    let pool_monitor = Arc::new(PoolMonitor::new(5000)); // 5 секунд TTL
+    let dex_scanner = MultiDexScanner::new(config.clone(), rpc_client.clone());
+    let arbitrage_finder = ArbitrageFinder::new(config.clone());
+    let executor = TransactionExecutor::new(
+        rpc_client.clone(),
+        keypair.clone(),
+        config.clone(),
+    )?;
+
+    info!("✅ Все компоненты инициализированы\n");
+
+    // СОЗДАНИЕ ТЕСТОВОЙ СРЕДЫ для devnet (TS-скрипты можно добавить позже,
+    // здесь реализация fallback на Rust гарантированно создаст 3 токена и 3 пула)
+    if config.rpc.url.contains("devnet") {
+        info!("🧪 Режим devnet: создание тестовой среды");
+
+        let test_setup = TestEnvironmentSetup::new(
+            rpc_client.clone(),
+            config.clone(),
+            keypair.clone(),
+        );
+
+        match test_setup.create_test_environment().await {
+            Ok(test_env) => {
+                info!("✅ Тестовая среда готова!");
+                info!("   📊 Пулов создано: {}", test_env.pools.len());
+                info!("   🪙 Token A: {} ({})", test_env.token_a.symbol, test_env.token_a.mint);
+                info!("   🪙 Token B: {} ({})", test_env.token_b.symbol, test_env.token_b.mint);
+                info!("   🪙 Token C: {} ({})", test_env.token_c.symbol, test_env.token_c.mint);
+                info!("   📈 Market ID: {}", test_env.market_id);
+
+                // Пулы в сканер и кэш
+                dex_scanner.set_test_pools(test_env.pools.clone());
+                for pool in &test_env.pools {
+                    pool_monitor.update_pool(pool.clone());
+                }
+                info!("   💡 Тестовые пулы установлены в сканер и кэш");
+            }
+            Err(e) => {
+                warn!("⚠️ Не удалось создать тестовую среду: {}", e);
+                info!("   Продолжаем с обычным сканированием...");
+            }
+        }
+    }
+
+    // Запуск фоновой очистки кэша
+    let monitor_clone = pool_monitor.clone();
+    tokio::spawn(async move {
+        scanner::pool_monitor::start_cache_cleanup_task(monitor_clone).await;
+    });
+
+    // Главный цикл бота
+    info!("🚀 Запуск главного цикла бота...");
+    info!("{}", "═".repeat(80));
+
+    let mut scan_interval = interval(Duration::from_millis(config.rpc.timeout_seconds * 1000));
+    let mut iteration = 0u64;
+
+    loop {
+        scan_interval.tick().await;
+        iteration += 1;
+
+        info!("\n⏰ Итерация #{} - {}", iteration, chrono::Local::now().format("%H:%M:%S"));
+
+        // Шаг 1: Сканирование пулов
+        match dex_scanner.scan_all_dex().await {
+            Ok(pools) => {
+                if pools.is_empty() {
+                    warn!("   ⚠️  Пулы не найдены. Убедитесь что тестовые пулы созданы на devnet.");
+                    continue;
+                }
+
+                // Обновление кэша
+                for pool in &pools {
+                    pool_monitor.update_pool(pool.clone());
+                }
+
+                info!("   📊 Активных пулов: {}", pools.len());
+
+                // Шаг 2: Поиск арбитражных возможностей
+                match arbitrage_finder.find_opportunities(&pools) {
+                    Ok(opportunities) => {
+                        if opportunities.is_empty() {
+                            info!("   ⏳ Прибыльных возможностей не найдено");
+                            continue;
+                        }
+
+                        info!("   🔥 Найдено возможностей: {}", opportunities.len());
+
+                        // Берём лучшую возможность
+                        let best = &opportunities[0];
+                        info!("   💎 Лучшая возможность:");
+                        info!("      Прибыль: {:.9} SOL ({:.4}%)",
+                              best.net_profit as f64 / 1_000_000_000.0,
+                              best.profit_percentage);
+                        info!("      Шагов: {}", best.legs.len());
+
+                        // Шаг 3: Исполнение арбитража
+                        info!("   🔧 Исполнение арбитража...");
+                        match executor.execute(best).await {
+                            Ok(signature) => {
+                                info!("   ✅ АРБИТРАЖ УСПЕШЕН!");
+                                info!("      Транзакция: {}", signature);
+                                info!("      Explorer: https://explorer.solana.com/tx/{}?cluster=devnet",
+                                      signature);
+                            }
+                            Err(e) => {
+                                error!("   ❌ Ошибка исполнения: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("   ❌ Ошибка поиска возможностей: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("   ❌ Ошибка сканирования пулов: {}", e);
+            }
+        }
+    }
+}
+
+/// Инициализация системы логирования
+fn init_logging() {
+    let log_level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_line_number(false))
+        .init();
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/main.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/jito_client.rs ---
+// bot/src/executor/jito_client.rs
+// Клиент для интеграции с Jito Block Engine (MEV защита)
+
+// bot/src/executor/jito_client.rs
+
+use anyhow::{Result, Context};
+use solana_sdk::{
+    pubkey::Pubkey,
+    transaction::Transaction,
+    // УДАЛИТЕ эту строку: signature::Signature,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use tracing::{info, warn, debug};
+
+// УДАЛИТЕ эту строку - она дублирует импорт:
+// use solana_sdk::pubkey::Pubkey;
+
+/// Конфигурация Jito
+pub struct JitoConfig {
+    pub block_engine_url: String,
+    pub tip_account: Pubkey,
+    pub tip_lamports: u64,
+}
+
+impl Default for JitoConfig {
+    fn default() -> Self {
+        Self {
+            block_engine_url: "https://mainnet.block-engine.jito.wtf".to_string(),
+            tip_account: Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5")
+                .expect("Invalid Jito tip account"),
+            tip_lamports: 300_000, // 0.0003 SOL минимальный tip
+        }
+    }
+}
+
+/// Клиент Jito Block Engine
+pub struct JitoClient {
+    config: JitoConfig,
+    http_client: Client,
+}
+
+impl JitoClient {
+    pub fn new(config: JitoConfig) -> Self {
+        Self {
+            config,
+            http_client: Client::new(),
+        }
+    }
+
+    /// Отправка bundle транзакций в Jito
+    ///
+    /// ВАЖНО: Jito Block Engine недоступен на devnet!
+    /// Эта функция работает только на mainnet.
+    pub async fn send_bundle(&self, transactions: Vec<Transaction>) -> Result<String> {
+        // Проверка devnet
+        if self.config.block_engine_url.contains("devnet") {
+            warn!("⚠️  Jito Block Engine недоступен на devnet. Используйте обычную отправку.");
+            anyhow::bail!("Jito не поддерживается на devnet");
+        }
+
+        info!("📦 Отправка bundle из {} транзакций в Jito...", transactions.len());
+
+        // Сериализация транзакций в base64
+        let encoded_txs: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx).expect("Failed to serialize tx");
+                bs58::encode(serialized).into_string()
+            })
+            .collect();
+
+        debug!("   Сериализовано {} транзакций", encoded_txs.len());
+
+        // Подготовка JSON-RPC запроса
+        let request = SendBundleRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "sendBundle".to_string(),
+            params: vec![encoded_txs],
+        };
+
+        // Отправка POST запроса к Jito API
+        let endpoint = format!("{}/api/v1/bundles", self.config.block_engine_url);
+        debug!("   Endpoint: {}", endpoint);
+
+        let response = self.http_client
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .context("Не удалось отправить bundle в Jito")?;
+
+        // Проверка статуса ответа
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("Jito вернул ошибку {}: {}", status, error_text);
+        }
+
+        // Парсинг ответа
+        let bundle_response: SendBundleResponse = response
+            .json()
+            .await
+            .context("Не удалось распарсить ответ Jito")?;
+
+        if let Some(error) = bundle_response.error {
+            anyhow::bail!("Jito RPC ошибка: {:?}", error);
+        }
+
+        let bundle_id = bundle_response.result
+            .ok_or_else(|| anyhow::anyhow!("Нет bundle_id в ответе Jito"))?;
+
+        info!("   ✅ Bundle отправлен, ID: {}", bundle_id);
+
+        Ok(bundle_id)
+    }
+
+    /// Проверка статуса bundle
+    pub async fn get_bundle_status(&self, bundle_id: &str) -> Result<BundleStatus> {
+        let request = GetBundleStatusRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "getBundleStatuses".to_string(),
+            params: vec![vec![bundle_id.to_string()]],
+        };
+
+        let endpoint = format!("{}/api/v1/bundles", self.config.block_engine_url);
+
+        let response = self.http_client
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .context("Не удалось получить статус bundle")?;
+
+        let status_response: GetBundleStatusResponse = response
+            .json()
+            .await
+            .context("Не удалось распарсить статус bundle")?;
+
+        let statuses = status_response.result.value
+            .ok_or_else(|| anyhow::anyhow!("Нет статусов в ответе"))?;
+
+        let status = statuses.first()
+            .ok_or_else(|| anyhow::anyhow!("Пустой массив статусов"))?;
+
+        Ok(status.clone())
+    }
+
+    /// Ожидание подтверждения bundle (с таймаутом)
+    pub async fn wait_for_confirmation(
+        &self,
+        bundle_id: &str,
+        timeout_seconds: u64,
+    ) -> Result<BundleStatus> {
+        use tokio::time::{sleep, Duration};
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(timeout_seconds);
+
+        loop {
+            if start.elapsed() > timeout {
+                anyhow::bail!("Таймаут ожидания подтверждения bundle");
+            }
+
+            let status = self.get_bundle_status(bundle_id).await?;
+
+            match status.confirmation_status.as_str() {
+                "confirmed" | "finalized" => {
+                    info!("   ✅ Bundle подтверждён: {}", status.confirmation_status);
+                    return Ok(status);
+                }
+                "failed" => {
+                    anyhow::bail!("Bundle провалился: {:?}", status.err);
+                }
+                "pending" => {
+                    debug!("   Bundle в ожидании... ({}s)", start.elapsed().as_secs());
+                    sleep(Duration::from_millis(500)).await;
+                }
+                _ => {
+                    debug!("   Неизвестный статус: {}", status.confirmation_status);
+                    sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// JSON-RPC СТРУКТУРЫ
+// ============================================================================
+
+#[derive(Serialize)]
+struct SendBundleRequest {
+    jsonrpc: String,
+    id: u64,
+    method: String,
+    params: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SendBundleResponse {
+    result: Option<String>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Serialize)]
+struct GetBundleStatusRequest {
+    jsonrpc: String,
+    id: u64,
+    method: String,
+    params: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct GetBundleStatusResponse {
+    result: BundleStatusResult,
+}
+
+#[derive(Deserialize)]
+struct BundleStatusResult {
+    value: Option<Vec<BundleStatus>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BundleStatus {
+    pub bundle_id: String,
+    pub confirmation_status: String,
+    pub err: Option<String>,
+    pub slot: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i32,
+    message: String,
+}
+
+// ============================================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================================
+
+/// Создание tip транзакции для Jito
+pub fn create_tip_instruction(
+    from: &Pubkey,
+    tip_account: &Pubkey,
+    lamports: u64,
+) -> solana_sdk::instruction::Instruction {
+    solana_sdk::system_instruction::transfer(from, tip_account, lamports)
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/jito_client.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/transaction_builder.rs ---
+// bot/src/executor/transaction_builder.rs
+use anchor_spl::{associated_token, token};
+use anyhow::{Context, Result};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    transaction::Transaction,
+};
+use std::sync::Arc;
+use tracing::{info, debug, warn};
+use anchor_lang::prelude::*;
+
+use crate::config::BotConfig;
+use crate::dex_structs::AmmInfo;
+use crate::types::{ArbitrageOpportunity, DexProtocol, SwapLeg};
+
+pub struct TransactionBuilder {
+    rpc_client: Arc<RpcClient>,
+    keypair: Arc<Keypair>,
+    config: Arc<BotConfig>,
+    program_id: Pubkey,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+struct ProgramSwapLeg {
+    protocol: u8,
+    pool_id: Pubkey,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    amount_in: u64,
+    minimum_amount_out: u64,
+    accounts_len: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+struct ExecuteArbitrageParams {
+    swap_legs: Vec<ProgramSwapLeg>,
+    min_profit_lamports: u64,
+}
+
+impl TransactionBuilder {
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        keypair: Arc<Keypair>,
+        config: Arc<BotConfig>,
+    ) -> Result<Self> {
+        let program_id = config.trading.executor_program_id.to_pubkey()?;
+        info!("🔧 Инициализация TransactionBuilder с program_id: {}", program_id);
+
+        Ok(Self {
+            rpc_client,
+            keypair,
+            config,
+            program_id,
+        })
+    }
+
+    fn get_recent_blockhash(&self) -> Result<Hash> {
+        Ok(self.rpc_client.get_latest_blockhash()?)
+    }
+
+    fn build_instruction_data(&self, swap_legs: Vec<ProgramSwapLeg>, min_profit: u64) -> Result<Vec<u8>> {
+        let discriminator: [u8; 8] = [0x3f, 0x39, 0x4c, 0x8f, 0x29, 0x34, 0x70, 0xd0];
+        let mut data = discriminator.to_vec();
+
+        let params = ExecuteArbitrageParams {
+            swap_legs,
+            min_profit_lamports: min_profit,
+        };
+
+        let serialized = params.try_to_vec().context("Не удалось сериализовать параметры")?;
+        data.extend_from_slice(&serialized);
+
+        debug!("📦 Размер данных инструкции: {} байт", data.len());
+        Ok(data)
+    }
+
+    pub async fn build_arbitrage_transaction(
+        &self,
+        opportunity: &ArbitrageOpportunity,
+    ) -> Result<Transaction> {
+        info!("🔨 Построение транзакции арбитража для {} свопов", opportunity.legs.len());
+
+        let recent_blockhash = self.get_recent_blockhash()?;
+        let mut instructions = Vec::new();
+        let mut all_accounts_for_cpi = Vec::new();
+
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+            self.config.trading.compute_unit_limit
+        ));
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+            self.config.trading.priority_fee_micro_lamports
+        ));
+
+        let mut program_swap_legs = Vec::new();
+        for (i, leg) in opportunity.legs.iter().enumerate() {
+            debug!("🔄 Обработка swap leg {}/{}: {:?}", i + 1, opportunity.legs.len(), leg.protocol);
+
+            let (leg_accounts, program_leg) = self.get_accounts_for_leg(leg).await?;
+            all_accounts_for_cpi.extend(leg_accounts);
+            program_swap_legs.push(program_leg);
+        }
+
+        let arbitrage_ix = self.build_execute_instruction(
+            program_swap_legs,
+            opportunity.net_profit,
+            all_accounts_for_cpi
+        )?;
+        instructions.push(arbitrage_ix);
+
+        let mut transaction = Transaction::new_with_payer(
+            &instructions,
+            Some(&self.keypair.pubkey())
+        );
+        transaction.sign(&[self.keypair.as_ref()], recent_blockhash);
+
+        info!("✅ Транзакция построена с {} инструкциями", instructions.len());
+        Ok(transaction)
+    }
+
+    async fn get_accounts_for_leg(&self, leg: &SwapLeg) -> Result<(Vec<AccountMeta>, ProgramSwapLeg)> {
+        match leg.protocol {
+            DexProtocol::RaydiumAmmV4 => self.get_raydium_amm_v4_accounts(leg).await,
+            DexProtocol::RaydiumCpmm => {
+                warn!("⚠️ RaydiumCpmm не реализован");
+                unimplemented!("RaydiumCpmm не реализован")
+            },
+            DexProtocol::RaydiumClmm => {
+                warn!("⚠️ RaydiumClmm не реализован");
+                unimplemented!("RaydiumClmm не реализован")
+            },
+            DexProtocol::MeteoraDlmm => {
+                warn!("⚠️ MeteoraDlmm не реализован");
+                unimplemented!("MeteoraDlmm не реализован")
+            },
+        }
+    }
+
+    async fn get_raydium_amm_v4_accounts(&self, leg: &SwapLeg) -> Result<(Vec<AccountMeta>, ProgramSwapLeg)> {
+        debug!("📊 Получение аккаунтов для Raydium AMM V4 пула: {}", leg.pool_id);
+
+        let pool_account = self.rpc_client.get_account(&leg.pool_id)?;
+        let amm_info = AmmInfo::try_from_slice(&pool_account.data)
+            .map_err(|e| anyhow::anyhow!("Ошибка десериализации AmmInfo: {}", e))?;
+
+        let raydium_program_id = self.config.dex.raydium_amm_v4.to_pubkey()?;
+
+        let user_source_ata = associated_token::get_associated_token_address(
+            &self.keypair.pubkey(),
+            &leg.input_mint
+        );
+        let user_dest_ata = associated_token::get_associated_token_address(
+            &self.keypair.pubkey(),
+            &leg.output_mint
+        );
+
+        // УПРОЩЕННАЯ ВЕРСИЯ - используем только основные аккаунты
+        let accounts = vec![
+            AccountMeta::new(leg.pool_id, false),
+            AccountMeta::new_readonly(amm_info.market_id, false),
+            AccountMeta::new(amm_info.base_vault, false),
+            AccountMeta::new(amm_info.quote_vault, false),
+            AccountMeta::new(user_source_ata, false),
+            AccountMeta::new(user_dest_ata, false),
+            AccountMeta::new_readonly(self.keypair.pubkey(), true),
+            AccountMeta::new_readonly(token::ID, false),
+        ];
+
+        debug!("   ✅ Подготовлено {} аккаунтов для Raydium AMM V4", accounts.len());
+
+        let program_leg = ProgramSwapLeg {
+            protocol: leg.protocol as u8,
+            pool_id: leg.pool_id,
+            input_mint: leg.input_mint,
+            output_mint: leg.output_mint,
+            amount_in: leg.amount_in,
+            minimum_amount_out: leg.minimum_amount_out,
+            accounts_len: accounts.len() as u8,
+        };
+
+        Ok((accounts, program_leg))
+    }
+
+    fn build_execute_instruction(
+        &self,
+        swap_legs: Vec<ProgramSwapLeg>,
+        min_profit: u64,
+        mut remaining_accounts: Vec<AccountMeta>,
+    ) -> Result<Instruction> {
+        let first_token_mint = swap_legs
+            .first()
+            .context("Нет свопов")?
+            .input_mint;
+
+        let user_token_account = associated_token::get_associated_token_address(
+            &self.keypair.pubkey(),
+            &first_token_mint
+        );
+
+        let mut accounts = vec![
+            AccountMeta::new(self.keypair.pubkey(), true),
+            AccountMeta::new(user_token_account, false),
+            AccountMeta::new_readonly(first_token_mint, false),
+            AccountMeta::new_readonly(token::ID, false),
+            // ИСПРАВЛЕНИЕ: Используем правильный system program ID
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ];
+
+        accounts.append(&mut remaining_accounts);
+
+        let instruction_data = self.build_instruction_data(swap_legs, min_profit)?;
+
+        info!("🎯 Создание execute_arbitrage инструкции с {} аккаунтами", accounts.len());
+
+        Ok(Instruction {
+            program_id: self.program_id,
+            accounts,
+            data: instruction_data,
+        })
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/transaction_builder.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/mod.rs ---
+// bot/src/executor/mod.rs
+
+pub mod transaction_builder;
+pub mod jito_client;
+pub mod simulator;
+
+use anyhow::Result;
+use solana_sdk::signature::{Keypair, Signature};
+use solana_client::rpc_client::RpcClient;
+use std::sync::Arc;
+use tracing::info;
+
+use crate::config::BotConfig;
+use crate::types::ArbitrageOpportunity;
+use transaction_builder::TransactionBuilder;
+use simulator::TransactionSimulator;
+
+pub struct TransactionExecutor {
+    rpc_client: Arc<RpcClient>,
+    builder: TransactionBuilder,
+    simulator: TransactionSimulator,
+}
+
+impl TransactionExecutor {
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        keypair: Arc<Keypair>,
+        config: Arc<BotConfig>,
+    ) -> Result<Self> {
+        Ok(Self {
+            builder: TransactionBuilder::new(
+                rpc_client.clone(),
+                keypair.clone(),
+                config.clone(),
+            )?,
+            simulator: TransactionSimulator::new(rpc_client.clone()),
+            rpc_client,
+        })
+    }
+
+    pub async fn execute(&self, opportunity: &ArbitrageOpportunity) -> Result<Signature> {
+        let transaction = self.builder.build_arbitrage_transaction(opportunity).await?;
+
+        info!("🧪 Симуляция транзакции...");
+        let simulation = self.simulator.simulate(&transaction).await?;
+        if let Some(err) = simulation.err {
+            anyhow::bail!("Симуляция провалилась: {}\nЛоги:\n{:#?}", err, simulation.logs);
+        }
+
+        info!("✅ Симуляция успешна (CU: {})", simulation.units_consumed.unwrap_or(0));
+
+        info!("📤 Отправка транзакции...");
+        let signature = self.rpc_client.send_and_confirm_transaction(&transaction)?;
+        Ok(signature)
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/mod.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/simulator.rs ---
+// bot/src/executor/simulator.rs (завершение)
+use tracing::debug;
+use solana_sdk::transaction::Transaction;
+use crate::types::SimulationResult;
+use anyhow::Result;
+use solana_client::rpc_client::RpcClient;
+use std::sync::Arc;
+pub struct TransactionSimulator {
+    rpc_client: Arc<RpcClient>,
+}
+/// Симуляция транзакции
+impl TransactionSimulator {
+    pub fn new(rpc_client: Arc<RpcClient>) -> Self {
+        Self { rpc_client }
+    }
+
+    pub async fn simulate(&self, transaction: &Transaction) -> Result<SimulationResult> {
+        let simulation = self.rpc_client
+            .simulate_transaction(transaction)
+            .map_err(|e| anyhow::anyhow!("Ошибка симуляции: {}", e))?;
+
+        let result = SimulationResult {
+            err: simulation.value.err.map(|e| format!("{:?}", e)),
+            logs: simulation.value.logs.clone().unwrap_or_default(),
+            units_consumed: simulation.value.units_consumed,
+        };
+
+        if let Some(ref err) = result.err {
+            debug!("Симуляция завершилась с ошибкой: {}", err);
+            if let Some(logs) = &simulation.value.logs {
+                for log in logs {
+                    debug!("  Log: {}", log);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Оценка compute units для транзакции
+    pub async fn estimate_compute_units(&self, transaction: &Transaction) -> Result<u64> {
+        let simulation = self.simulate(transaction).await?;
+
+        simulation.units_consumed
+            .ok_or_else(|| anyhow::anyhow!("Не удалось определить compute units"))
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/executor/simulator.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/config.rs ---
+// bot/src/config.rs
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::str::FromStr;
+use solana_sdk::pubkey::Pubkey;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BotConfig {
+    pub rpc: RpcConfig,
+    pub wallet: WalletConfig,
+    pub trading: TradingConfig,
+    pub dex: DexConfig,
+    pub jito: Option<JitoConfig>,
+    pub monitoring: MonitoringConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcConfig {
+    pub url: String,
+    pub ws_url: String,
+    pub commitment: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingConfig {
+    pub executor_program_id: PubkeyString,
+    pub min_profit_lamports: u64,
+    pub min_profit_bps: u16,
+    pub max_slippage_bps: u16,
+    pub initial_amount_sol: f64,
+    pub max_legs: u8,
+    pub compute_unit_limit: u32,
+    pub priority_fee_micro_lamports: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DexConfig {
+    pub raydium_amm_v4: PubkeyString,
+    pub raydium_cpmm: PubkeyString,
+    pub raydium_clmm: PubkeyString,
+    pub meteora_dlmm: PubkeyString,
+    pub openbook_id: PubkeyString,  // НОВОЕ ПОЛЕ
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JitoConfig {
+    pub block_engine_url: String,
+    pub tip_account: PubkeyString,
+    pub tip_lamports: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    pub log_level: String,
+    pub telemetry_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubkeyString(pub String);
+
+impl PubkeyString {
+    pub fn to_pubkey(&self) -> Result<Pubkey> {
+        Pubkey::from_str(&self.0).context("Invalid pubkey")
+    }
+}
+
+impl BotConfig {
+    pub fn load() -> Result<Self> {
+        dotenv::dotenv().ok();
+
+        // ПОДДЕРЖКА КЛАСТЕРОВ
+        let cluster = std::env::var("SOLANA_CLUSTER").unwrap_or_else(|_| "mainnet".to_string());
+        let is_devnet = cluster.eq_ignore_ascii_case("devnet");
+
+        let (rpc_url, ws_url) = if is_devnet {
+            (
+                "https://api.devnet.solana.com".to_string(),
+                "wss://api.devnet.solana.com".to_string(),
+            )
+        } else {
+            (
+                std::env::var("SOLANA_RPC_URL")
+                    .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
+                std::env::var("SOLANA_WS_URL")
+                    .unwrap_or_else(|_| "wss://api.mainnet-beta.solana.com".to_string()),
+            )
+        };
+
+        // ПРАВИЛЬНЫЕ PROGRAM IDs ДЛЯ DEVNET/MAINNET
+        let dex = if is_devnet {
+            DexConfig {
+                raydium_amm_v4: PubkeyString("DRaya7Kj3aMWQSy19kSjvmuwq9docCHofyP9kanQGaav".to_string()),
+                raydium_cpmm: PubkeyString("DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb".to_string()),
+                raydium_clmm: PubkeyString("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH".to_string()),
+                meteora_dlmm: PubkeyString("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string()),
+                openbook_id: PubkeyString("opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb".to_string()),
+            }
+        } else {
+            DexConfig {
+                raydium_amm_v4: PubkeyString("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".to_string()),
+                raydium_cpmm: PubkeyString("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C".to_string()),
+                raydium_clmm: PubkeyString("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string()),
+                meteora_dlmm: PubkeyString("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string()),
+                openbook_id: PubkeyString("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX".to_string()),
+            }
+        };
+
+        Ok(Self {
+            rpc: RpcConfig {
+                url: rpc_url,
+                ws_url,
+                commitment: "confirmed".to_string(),
+                timeout_seconds: 30,
+            },
+            wallet: WalletConfig {
+                path: std::env::var("WALLET_PATH")
+                    .unwrap_or_else(|_| "~/.config/solana/id.json".to_string())
+                    .into(),
+            },
+            trading: TradingConfig {
+                executor_program_id: PubkeyString(
+                    std::env::var("ARBITRAGE_EXECUTOR_PROGRAM_ID")
+                        .context("ARBITRAGE_EXECUTOR_PROGRAM_ID не найден в .env")?,
+                ),
+                min_profit_lamports: std::env::var("MIN_PROFIT_LAMPORTS")
+                    .unwrap_or_else(|_| "1000".to_string())
+                    .parse()
+                    .context("Invalid MIN_PROFIT_LAMPORTS")?,
+                min_profit_bps: std::env::var("MIN_PROFIT_BPS")
+                    .unwrap_or_else(|_| "10".to_string())
+                    .parse()
+                    .context("Invalid MIN_PROFIT_BPS")?,
+                max_slippage_bps: std::env::var("MAX_SLIPPAGE_BPS")
+                    .unwrap_or_else(|_| "500".to_string())
+                    .parse()
+                    .context("Invalid MAX_SLIPPAGE_BPS")?,
+                initial_amount_sol: std::env::var("INITIAL_AMOUNT_SOL")
+                    .unwrap_or_else(|_| "0.01".to_string())
+                    .parse()
+                    .context("Invalid INITIAL_AMOUNT_SOL")?,
+                max_legs: 5,
+                compute_unit_limit: 400_000,
+                priority_fee_micro_lamports: 100_000,
+            },
+            dex,
+            jito: None, // Отключаем Jito на devnet
+            monitoring: MonitoringConfig {
+                log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
+                telemetry_enabled: std::env::var("TELEMETRY_ENABLED")
+                    .unwrap_or_else(|_| "false".to_string())
+                    .parse()
+                    .unwrap_or(false),
+            },
+        })
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/config.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/pool_math.rs ---
+// bot/src/arbitrage/pool_math.rs
+
+use anyhow::Result;
+
+/// Расчет выхода для пула CPMM (Constant Product Market Maker)
+pub fn calculate_cpmm_output(
+    reserve_in: u64,
+    reserve_out: u64,
+    amount_in: u64,
+    fee_bps: u16,
+) -> Result<u64> {
+    if reserve_in == 0 || reserve_out == 0 {
+        anyhow::bail!("Нулевые резервы в CPMM пуле");
+    }
+
+    let fee_multiplier = 1.0 - (fee_bps as f64 / 10000.0);
+    let amount_in_with_fee = (amount_in as f64) * fee_multiplier;
+
+    let numerator = (reserve_out as f64) * amount_in_with_fee;
+    let denominator = (reserve_in as f64) + amount_in_with_fee;
+
+    let amount_out = numerator / denominator;
+    Ok(amount_out as u64)
+}
+
+/// Расчет выхода для пула CLMM (Concentrated Liquidity)
+pub fn calculate_clmm_output(
+    liquidity: u128,
+    sqrt_price_current: u128,
+    sqrt_price_next: u128,
+    amount_in: u64,
+    fee_bps: u16,
+) -> Result<u64> {
+    if liquidity == 0 {
+        anyhow::bail!("Нулевая ликвидность в CLMM пуле");
+    }
+
+    let fee_multiplier = 1.0 - (fee_bps as f64 / 10000.0);
+    let _amount_in_with_fee = (amount_in as f64) * fee_multiplier;
+
+    let l_f64 = liquidity as f64;
+    let sqrt_p_current = sqrt_price_current as f64;
+    let sqrt_p_next = sqrt_price_next as f64;
+
+    let delta_y = l_f64 * (sqrt_p_next - sqrt_p_current) / (sqrt_p_current * sqrt_p_next);
+    let amount_out = delta_y * fee_multiplier;
+
+    Ok(amount_out as u64)
+}
+
+/// Расчет выхода для пула DLMM (Dynamic Liquidity Market Maker)
+pub fn calculate_dlmm_output(
+    bin_liquidity: u64,
+    bin_price: f64,
+    composition: f64,
+    amount_in: u64,
+    base_fee_bps: u16,
+    variable_fee_bps: u16,
+) -> Result<u64> {
+    if bin_liquidity == 0 {
+        anyhow::bail!("Нулевая ликвидность в DLMM бине");
+    }
+
+    let total_fee_bps = base_fee_bps + variable_fee_bps;
+    let fee_multiplier = 1.0 - (total_fee_bps as f64 / 10000.0);
+
+    let l_f64 = bin_liquidity as f64;
+    let reserve_y = composition * l_f64;
+    let reserve_x = l_f64 / (bin_price * (1.0 - composition));
+
+    let amount_in_with_fee = (amount_in as f64) * fee_multiplier;
+    let numerator = reserve_y * amount_in_with_fee;
+    let denominator = reserve_x + amount_in_with_fee;
+
+    let amount_out = numerator / denominator;
+    Ok(amount_out as u64)
+}
+
+/// Расчет минимального выхода с учетом slippage
+pub fn calculate_minimum_amount_out(
+    expected_amount: u64,
+    slippage_bps: u16,
+) -> u64 {
+    let slippage_multiplier = 1.0 - (slippage_bps as f64 / 10000.0);
+    ((expected_amount as f64) * slippage_multiplier) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cpmm_calculation() {
+        let output = calculate_cpmm_output(
+            1_000_000_000,
+            1_000_000_000,
+            100_000_000,
+            25,
+        ).unwrap();
+
+        assert!(output > 90_000_000 && output < 100_000_000);
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/pool_math.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/opportunity.rs ---
+// bot/src/arbitrage/opportunity.rs
+// Оценка и валидация арбитражных возможностей
+
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::info;
+
+use solana_sdk::pubkey::Pubkey;
+
+use super::bellman_ford::ArbitrageCycle;
+use super::profit_calculator::ProfitCalculator;
+use crate::config::BotConfig;
+use crate::types::{ArbitrageOpportunity, DexProtocol, PoolState, SwapLeg};
+
+pub struct OpportunityEvaluator {
+    config: Arc<BotConfig>,
+    profit_calc: ProfitCalculator,
+}
+
+impl OpportunityEvaluator {
+    pub fn new(config: Arc<BotConfig>) -> Self {
+        Self {
+            profit_calc: ProfitCalculator::new(config.clone()),
+            config,
+        }
+    }
+
+    /// Строим таблицу decimals по mint-адресам из списка пулов.
+    fn build_decimals_map(&self, pools: &[PoolState]) -> HashMap<Pubkey, u8> {
+        let mut m = HashMap::new();
+        for p in pools {
+            // Заполняем только если не было значений ранее
+            m.entry(p.token_a).or_insert(p.decimals_a);
+            m.entry(p.token_b).or_insert(p.decimals_b);
+        }
+        m
+    }
+
+    /// Оценка цикла и создание ArbitrageOpportunity
+    pub fn evaluate_cycle(
+        &self,
+        cycle: &ArbitrageCycle,
+        pools: &[PoolState],
+    ) -> Result<Option<ArbitrageOpportunity>> {
+        // Минимум три токена (A -> B -> C -> A)
+        if cycle.tokens.len() < 3 {
+            return Ok(None);
+        }
+
+        info!("🔍 === ДЕТАЛЬНАЯ ДИАГНОСТИКА ЦИКЛА ===");
+        info!("Токенов в цикле: {}", cycle.tokens.len());
+
+        // Построим карту decimals из пулов
+        let decimals_map = self.build_decimals_map(pools);
+
+        // Начальная сумма: интерпретируем initial_amount_sol как количество в UI-единицах
+        // стартового токена и переводим в атомы стартового токена.
+        let start_mint = cycle.tokens[0];
+        let start_decimals = *decimals_map
+            .get(&start_mint)
+            .ok_or_else(|| anyhow::anyhow!("Не найдены decimals для стартового токена"))?;
+        let ui_amount = self.config.trading.initial_amount_sol; // используем как UI количество
+        let mut current_amount: u64 =
+            (ui_amount * 10f64.powi(start_decimals as i32)) as u64;
+
+        info!(
+            "💰 Начальная сумма: {} atoms (mint: {}, decimals: {})",
+            current_amount, start_mint, start_decimals
+        );
+
+        // Построение swap legs с детальным логированием
+        let mut legs: Vec<SwapLeg> = Vec::new();
+
+        for i in 0..cycle.tokens.len() - 1 {
+            let input_mint = cycle.tokens[i];
+            let output_mint = cycle.tokens[i + 1];
+
+            info!("🔄 === СВОП #{} ===", i + 1);
+            info!("От: {}", input_mint);
+            info!("К:  {}", output_mint);
+
+            // Находим пул для этой пары
+            let pool = pools
+                .iter()
+                .find(|p| {
+                    (p.token_a == input_mint && p.token_b == output_mint)
+                        || (p.token_a == output_mint && p.token_b == input_mint)
+                })
+                .ok_or_else(|| anyhow::anyhow!("Пул не найден для пары токенов"))?;
+
+            info!("📊 Найден пул: {}", pool.id);
+            info!(
+                "   Token A: {} (резерв: {} atoms, decimals: {}), Token B: {} (резерв: {} atoms, decimals: {})",
+                pool.token_a, pool.reserve_a, pool.decimals_a, pool.token_b, pool.reserve_b, pool.decimals_b
+            );
+
+            // Определяем направление свопа
+            let a_to_b = input_mint == pool.token_a;
+            info!("🔀 Направление: {}", if a_to_b { "A→B" } else { "B→A" });
+
+            // Рассчитываем ожидаемый выход
+            let (estimated_out, min_out) =
+                self.calculate_swap_amounts(pool, current_amount, a_to_b)?;
+
+            info!("💸 Входная сумма: {} atoms", current_amount);
+            info!("💰 Ожидаемый выход: {} atoms", estimated_out);
+            info!("📉 Минимальный выход: {} atoms", min_out);
+
+            let exchange_rate = if current_amount > 0 {
+                estimated_out as f64 / current_amount as f64
+            } else {
+                0.0
+            };
+            info!("💹 Обменный курс: {:.6}", exchange_rate);
+
+            if estimated_out > current_amount {
+                info!(
+                    "✅ Прибыльный своп (+{} atoms)",
+                    estimated_out - current_amount
+                );
+            } else {
+                info!(
+                    "❌ Убыточный своп (-{} atoms)",
+                    current_amount - estimated_out
+                );
+            }
+
+            let leg = SwapLeg {
+                protocol: pool.protocol,
+                pool_id: pool.id,
+                input_mint,
+                output_mint,
+                amount_in: current_amount,
+                minimum_amount_out: min_out,
+                estimated_amount_out: estimated_out,
+                fee_bps: pool.fee_bps,
+                pool_state_data: pool.full_state_data.clone(),
+            };
+
+            legs.push(leg);
+            current_amount = estimated_out; // Для следующего свопа
+        }
+
+        // Расчёт чистой прибыли — работаем в атомах стартового токена
+        let initial_amount = legs[0].amount_in;
+        let final_amount = legs.last().unwrap().estimated_amount_out;
+
+        info!("📊 === ИТОГОВЫЙ РАСЧЕТ ===");
+        info!(
+            "🏁 Начальная сумма: {} atoms (mint: {}, decimals: {})",
+            initial_amount, start_mint, start_decimals
+        );
+        info!(
+            "🎯 Финальная сумма: {} atoms (mint: {}, decimals: {})",
+            final_amount, start_mint, start_decimals
+        );
+
+        // ProfitCalculator оставляем как есть — он работает на u64.
+        // В devnet не учитываем SOL комиссии (они в другой единице).
+        let (gross_profit, net_profit) =
+            self.profit_calc
+                .calculate_net_profit(initial_amount, final_amount, &legs)?;
+
+        info!("💎 Валовая прибыль: {} atoms", gross_profit);
+        info!("🏦 Чистая прибыль: {} atoms", net_profit);
+        info!(
+            "📊 Минимальный порог: {} atoms",
+            self.config.trading.min_profit_lamports
+        );
+
+        // Проверка прибыльности
+        if net_profit < self.config.trading.min_profit_lamports {
+            info!(
+                "❌ ОТКЛОНЕНО: Прибыль {} < {} (порог)",
+                net_profit, self.config.trading.min_profit_lamports
+            );
+            info!("💡 Попробуйте понизить MIN_PROFIT_LAMPORTS в .env файле");
+            return Ok(None);
+        }
+
+        let profit_percentage = if initial_amount > 0 {
+            (net_profit as f64 / initial_amount as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        info!("✅ ПРИНЯТО: Арбитражная возможность одобрена!");
+        info!("📈 Процент прибыли: {:.4}%", profit_percentage);
+
+        let opportunity = ArbitrageOpportunity {
+            legs,
+            initial_amount,
+            expected_final_amount: final_amount,
+            gross_profit,
+            net_profit,
+            profit_percentage,
+            discovered_at: chrono::Utc::now().timestamp(),
+        };
+
+        Ok(Some(opportunity))
+    }
+
+    /// Расчёт ожидаемого и минимального выхода свопа в атомарных единицах токена
+    fn calculate_swap_amounts(
+        &self,
+        pool: &PoolState,
+        amount_in: u64,
+        a_to_b: bool,
+    ) -> Result<(u64, u64)> {
+        let (reserve_in, reserve_out) = if a_to_b {
+            (pool.reserve_a, pool.reserve_b)
+        } else {
+            (pool.reserve_b, pool.reserve_a)
+        };
+
+        // Для всех тестовых пулов (AMM/CPMM/DLMM) используем CPMM-формулу
+        let estimated_out = {
+            use crate::arbitrage::pool_math::calculate_cpmm_output;
+            calculate_cpmm_output(reserve_in, reserve_out, amount_in, pool.fee_bps)?
+        };
+
+        // Минимальный выход с учётом slippage
+        use crate::arbitrage::pool_math::calculate_minimum_amount_out;
+        let min_out =
+            calculate_minimum_amount_out(estimated_out, self.config.trading.max_slippage_bps);
+
+        Ok((estimated_out, min_out))
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/opportunity.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/profit_calculator.rs ---
+// bot/src/arbitrage/profit_calculator.rs
+// Расчёт чистой прибыли с учётом всех комиссий
+
+use anyhow::Result;
+use std::sync::Arc;
+
+use crate::config::BotConfig;
+use crate::types::SwapLeg;
+
+pub struct ProfitCalculator {
+    config: Arc<BotConfig>,
+}
+
+impl ProfitCalculator {
+    pub fn new(config: Arc<BotConfig>) -> Self {
+        Self { config }
+    }
+
+    /// Расчёт чистой прибыли с учётом комиссий
+    /// В devnet НЕ вычитаем SOL-комиссии (другая единица) — работаем в атомах стартового токена
+    pub fn calculate_net_profit(
+        &self,
+        initial_amount: u64,
+        final_amount: u64,
+        _legs: &[SwapLeg],
+    ) -> Result<(u64, u64)> {
+        // Валовая прибыль в атомах токена
+        let gross_profit = if final_amount >= initial_amount {
+            final_amount - initial_amount
+        } else {
+            initial_amount - final_amount
+        };
+
+        // Devnet: игнорируем комиссии в SOL (lamports), т.к. считаем в атомах токена
+        let is_devnet = self.config.rpc.url.contains("devnet");
+
+        let net_profit = if is_devnet {
+            gross_profit
+        } else {
+            // Для mainnet здесь следовало бы:
+            // 1) рассчитать SOL-комиссии (tx_base_fee, priority_fee, jito_tip)
+            // 2) сконвертировать их в атомы токена A через прайс-оракул
+            // 3) вычесть из gross_profit
+            gross_profit
+        };
+
+        Ok((gross_profit, net_profit))
+    }
+
+    /// Оценка максимально допустимого slippage (оставлено без изменений)
+    pub fn calculate_max_slippage(
+        &self,
+        initial_amount: u64,
+        expected_profit: u64,
+    ) -> f64 {
+        let max_loss = expected_profit.saturating_sub(self.config.trading.min_profit_lamports);
+        if expected_profit == 0 { return 0.0; }
+        (max_loss as f64 / expected_profit as f64) * 100.0
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/profit_calculator.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/graph.rs ---
+// bot/src/arbitrage/graph.rs
+// Построение графа цен для поиска арбитража
+
+use anyhow::Result;
+use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
+use tracing::debug;
+
+use crate::types::{PoolState, PriceEdge};
+
+/// Граф цен между токенами
+pub struct PriceGraph {
+    /// Соответствие токен -> индекс в графе
+    token_to_index: HashMap<Pubkey, usize>,
+    /// Соответствие индекс -> токен
+    index_to_token: Vec<Pubkey>,
+    /// Матрица смежности: adjacency[from][to] = vec![PriceEdge]
+    adjacency: Vec<Vec<Vec<PriceEdge>>>,
+}
+
+impl PriceGraph {
+    pub fn new() -> Self {
+        Self {
+            token_to_index: HashMap::new(),
+            index_to_token: Vec::new(),
+            adjacency: Vec::new(),
+        }
+    }
+
+    /// Построение графа из списка пулов
+    pub fn build_from_pools(&self, pools: &[PoolState]) -> Result<PriceGraph> {
+        let mut graph = PriceGraph::new();
+
+        // Шаг 1: Собираем все уникальные токены
+        for pool in pools {
+            graph.add_token_if_new(pool.token_a);
+            graph.add_token_if_new(pool.token_b);
+        }
+        let max_pools = 2000;
+        let pools = if pools.len() > max_pools {
+            tracing::warn!("⚠️ Ограничение пулов с {} до {}", pools.len(), max_pools);
+            &pools[..max_pools]
+        } else {
+            pools
+        };
+
+        // Собираем токены и считаем, сколько будет узлов
+        // ...
+        let n = graph.token_count();
+
+        // Если токенов слишком много — останавливаемся заранее
+        let max_tokens = if pools.len() < 100 { 1000 } else { 100 }; // ДИНАМИЧЕСКИЙ ЛИМИТ
+        if n > max_tokens {
+            anyhow::bail!("Слишком большой граф: {} токенов (> {})", n, max_tokens);
+        }
+        // Инициализация матрицы смежности
+        let n = graph.token_count();
+        graph.adjacency = vec![vec![Vec::new(); n]; n];
+
+        // Шаг 2: Добавляем рёбра для каждого пула
+        for pool in pools {
+            // Направление A -> B
+            let edge_ab = PriceEdge {
+                from_token: pool.token_a,
+                to_token: pool.token_b,
+                pool_id: pool.id,
+                protocol: pool.protocol,
+                weight: Self::calculate_edge_weight(pool, true)?,
+                fee_bps: pool.fee_bps,
+            };
+
+            // Направление B -> A
+            let edge_ba = PriceEdge {
+                from_token: pool.token_b,
+                to_token: pool.token_a,
+                pool_id: pool.id,
+                protocol: pool.protocol,
+                weight: Self::calculate_edge_weight(pool, false)?,
+                fee_bps: pool.fee_bps,
+            };
+
+            graph.add_edge(edge_ab)?;
+            graph.add_edge(edge_ba)?;
+        }
+
+        debug!("Граф построен: {} токенов, {} рёбер", n, graph.edge_count());
+        Ok(graph)
+    }
+
+    /// Вычисление веса ребра (отрицательный логарифм обменного курса)
+    /// Bellman-Ford находит минимальные пути, отрицательный цикл = прибыль
+    fn calculate_edge_weight(pool: &PoolState, a_to_b: bool) -> Result<f64> {
+        let (reserve_in, reserve_out) = if a_to_b {
+            (pool.reserve_a as f64, pool.reserve_b as f64)
+        } else {
+            (pool.reserve_b as f64, pool.reserve_a as f64)
+        };
+
+        if reserve_in <= 0.0 || reserve_out <= 0.0 {
+            anyhow::bail!("Нулевые резервы в пуле");
+        }
+
+        // Учёт комиссии (fee_bps / 10000)
+        let fee_multiplier = 1.0 - (pool.fee_bps as f64 / 10000.0);
+
+        // Обменный курс с учётом комиссии
+        let exchange_rate = (reserve_out / reserve_in) * fee_multiplier;
+
+        // Вес = -log(exchange_rate)
+        // Отрицательный цикл означает произведение курсов > 1 (прибыль)
+        let weight = -(exchange_rate.ln());
+
+        Ok(weight)
+    }
+
+    /// Добавление токена если ещё не существует
+    fn add_token_if_new(&mut self, token: Pubkey) {
+        if !self.token_to_index.contains_key(&token) {
+            let index = self.index_to_token.len();
+            self.token_to_index.insert(token, index);
+            self.index_to_token.push(token);
+        }
+    }
+
+    /// Добавление ребра в граф
+    fn add_edge(&mut self, edge: PriceEdge) -> Result<()> {
+        let from_idx = self.token_to_index.get(&edge.from_token)
+            .ok_or_else(|| anyhow::anyhow!("Токен не найден в графе"))?;
+        let to_idx = self.token_to_index.get(&edge.to_token)
+            .ok_or_else(|| anyhow::anyhow!("Токен не найден в графе"))?;
+
+        self.adjacency[*from_idx][*to_idx].push(edge);
+        Ok(())
+    }
+
+    /// Получение токена по индексу
+    pub fn get_token(&self, index: usize) -> Option<&Pubkey> {
+        self.index_to_token.get(index)
+    }
+
+    /// Получение индекса токена
+    pub fn get_index(&self, token: &Pubkey) -> Option<usize> {
+        self.token_to_index.get(token).copied()
+    }
+
+    /// Получение всех рёбер между двумя токенами
+    pub fn get_edges(&self, from: usize, to: usize) -> &[PriceEdge] {
+        &self.adjacency[from][to]
+    }
+
+    /// Количество токенов в графе
+    pub fn token_count(&self) -> usize {
+        self.index_to_token.len()
+    }
+
+    /// Количество рёбер в графе
+    pub fn edge_count(&self) -> usize {
+        self.adjacency.iter()
+            .flat_map(|row| row.iter())
+            .map(|edges| edges.len())
+            .sum()
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/graph.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/mod.rs ---
+// bot/src/arbitrage/mod.rs
+// Оркестратор поиска арбитражных возможностей
+
+pub mod graph;
+pub mod bellman_ford;
+pub mod opportunity;
+pub mod profit_calculator;
+pub mod pool_math;
+
+use anyhow::Result;
+use std::sync::Arc;
+use tracing::{info, debug};
+
+use crate::config::BotConfig;
+use crate::types::{PoolState, ArbitrageOpportunity};
+use graph::PriceGraph;
+use bellman_ford::BellmanFordSolver;
+use opportunity::OpportunityEvaluator;
+
+pub struct ArbitrageFinder {
+    config: Arc<BotConfig>,
+    graph_builder: PriceGraph,
+    solver: BellmanFordSolver,
+    evaluator: OpportunityEvaluator,
+}
+
+impl ArbitrageFinder {
+    pub fn new(config: Arc<BotConfig>) -> Self {
+        Self {
+            config: config.clone(),
+            graph_builder: PriceGraph::new(),
+            solver: BellmanFordSolver::new(),
+            evaluator: OpportunityEvaluator::new(config),
+        }
+    }
+
+    /// Поиск всех арбитражных возможностей в заданных пулах
+    pub fn find_opportunities(&self, pools: &[PoolState]) -> Result<Vec<ArbitrageOpportunity>> {
+        if pools.is_empty() {
+            return Ok(vec![]);
+        }
+
+        info!("🔍 Построение графа цен из {} пулов...", pools.len());
+
+        // Шаг 1: Построение графа цен
+        let graph = self.graph_builder.build_from_pools(pools)?;
+        debug!("   Граф содержит {} токенов, {} рёбер",
+           graph.token_count(),
+           graph.edge_count());
+
+        // Шаг 2: Поиск отрицательных циклов через Bellman-Ford
+        info!("🧮 Применение алгоритма Bellman-Ford для поиска циклов...");
+        let cycles = self.solver.find_negative_cycles(&graph, self.config.trading.max_legs as usize)?;
+
+        if cycles.is_empty() {
+            debug!("   Отрицательных циклов не найдено");
+            return Ok(vec![]);
+        }
+
+        info!("   Найдено потенциальных циклов: {}", cycles.len());
+
+        // ДИАГНОСТИКА: Показать информацию о каждом цикле
+        for (i, cycle) in cycles.iter().enumerate() {
+            info!("🔄 Цикл #{}: {} токенов, вес {:.6}",
+             i + 1, cycle.tokens.len(), cycle.total_weight);
+            info!("   Токены: {:?}", cycle.tokens.iter()
+             .map(|t| format!("{}...", &t.to_string()[..8]))
+             .collect::<Vec<_>>());
+        }
+
+        // Шаг 3: Оценка прибыльности каждого цикла
+        let mut opportunities = Vec::new();
+
+        for (i, cycle) in cycles.iter().enumerate() {
+            info!("🧮 === АНАЛИЗ ЦИКЛА #{} ===", i + 1);
+
+            match self.evaluator.evaluate_cycle(cycle, pools) {
+                Ok(Some(opp)) => {
+                    info!("✅ Цикл #{} ПРИБЫЛЕН!", i + 1);
+                    // Проверка минимальной прибыли
+                    if opp.net_profit >= self.config.trading.min_profit_lamports {
+                        opportunities.push(opp);
+                    }
+                }
+                Ok(None) => {
+                    info!("❌ Цикл #{} отклонен", i + 1);
+                }
+                Err(e) => {
+                    info!("⚠️ Ошибка анализа цикла #{}: {}", i + 1, e);
+                }
+            }
+        }
+
+        // Сортировка по убыванию прибыли
+        opportunities.sort_by(|a, b| b.net_profit.cmp(&a.net_profit));
+
+        info!("✅ Найдено прибыльных возможностей: {}", opportunities.len());
+
+        Ok(opportunities)
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/mod.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/bellman_ford.rs ---
+// bot/src/arbitrage/bellman_ford.rs
+
+use anyhow::Result;
+use solana_sdk::pubkey::Pubkey;
+// ИСПРАВЛЕНИЕ: Удаляем неиспользуемый HashMap
+use std::collections::HashSet;
+use tracing::{info, debug};
+
+use super::graph::PriceGraph;
+
+#[derive(Debug, Clone)]
+pub struct ArbitrageCycle {
+    pub tokens: Vec<Pubkey>,
+    pub total_weight: f64,
+}
+
+pub struct BellmanFordSolver;
+
+impl BellmanFordSolver {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// ИСПРАВЛЕННЫЙ поиск арбитражных циклов
+    pub fn find_negative_cycles(
+        &self,
+        graph: &PriceGraph,
+        _max_legs: usize, // ИСПРАВЛЕНИЕ: Добавили префикс _
+    ) -> Result<Vec<ArbitrageCycle>> {
+        let n = graph.token_count();
+
+        info!("🔍 === ДИАГНОСТИКА ГРАФА ===");
+        info!("Токенов в графе: {}", n);
+
+        // Диагностика: показать все рёбра графа
+        let mut total_edges = 0;
+        for from in 0..n {
+            for to in 0..n {
+                let edges = graph.get_edges(from, to);
+                if !edges.is_empty() {
+                    total_edges += edges.len();
+                    if let (Some(from_token), Some(to_token)) = (graph.get_token(from), graph.get_token(to)) {
+                        info!("   Ребро: {}... -> {}... ({} вариантов)",
+                             &from_token.to_string()[..8],
+                             &to_token.to_string()[..8],
+                             edges.len());
+                    }
+                }
+            }
+        }
+
+        info!("Всего рёбер: {}", total_edges);
+
+        if total_edges == 0 {
+            info!("❌ ГРАФ ПУСТОЙ! Нет рёбер между токенами!");
+            return Ok(vec![]);
+        }
+
+        // Ищем циклы методом прямого поиска
+        let mut cycles = Vec::new();
+        let mut found_cycles = HashSet::new();
+
+        info!("🔄 === ПОИСК ТРЕУГОЛЬНЫХ АРБИТРАЖЕЙ ===");
+
+        // Перебираем все возможные треугольники
+        for start_idx in 0..n {
+            for mid_idx in 0..n {
+                if mid_idx == start_idx { continue; }
+
+                for end_idx in 0..n {
+                    if end_idx == start_idx || end_idx == mid_idx { continue; }
+
+                    // Проверяем путь: start → mid → end → start
+                    if let Some(cycle) = self.check_triangle_arbitrage(
+                        graph, start_idx, mid_idx, end_idx
+                    )? {
+                        let cycle_signature = self.get_cycle_signature(&cycle);
+
+                        if !found_cycles.contains(&cycle_signature) {
+                            found_cycles.insert(cycle_signature);
+
+                            info!("🎯 НАЙДЕН ТРЕУГОЛЬНЫЙ АРБИТРАЖ!");
+                            info!("   Путь: {} → {} → {} → {}",
+                                 &cycle.tokens[0].to_string()[..8],
+                                 &cycle.tokens[1].to_string()[..8],
+                                 &cycle.tokens[2].to_string()[..8],
+                                 &cycle.tokens[3].to_string()[..8]);
+                            info!("   Общий вес: {:.6}", cycle.total_weight);
+
+                            if cycle.total_weight < -0.001 { // Прибыльный
+                                info!("   ✅ ПРИБЫЛЬНЫЙ!");
+                                cycles.push(cycle);
+                            } else {
+                                info!("   ❌ Не прибыльный");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("🏁 Найдено арбитражных циклов: {}", cycles.len());
+        Ok(cycles)
+    }
+
+    /// Проверяем треугольный арбитраж A→B→C→A
+    fn check_triangle_arbitrage(
+        &self,
+        graph: &PriceGraph,
+        a_idx: usize,
+        b_idx: usize,
+        c_idx: usize,
+    ) -> Result<Option<ArbitrageCycle>> {
+        // Проверяем существование всех трёх рёбер
+        let edges_ab = graph.get_edges(a_idx, b_idx);
+        let edges_bc = graph.get_edges(b_idx, c_idx);
+        let edges_ca = graph.get_edges(c_idx, a_idx);
+
+        if edges_ab.is_empty() || edges_bc.is_empty() || edges_ca.is_empty() {
+            return Ok(None); // Нет полного пути
+        }
+
+        // Берём первое доступное ребро для каждого перехода
+        let edge_ab = &edges_ab[0];
+        let edge_bc = &edges_bc[0];
+        let edge_ca = &edges_ca[0];
+
+        // Вычисляем общий вес цикла
+        let total_weight = edge_ab.weight + edge_bc.weight + edge_ca.weight;
+
+        debug!("   Проверка цикла {}->{}->{} = {:.6}",
+               a_idx, b_idx, c_idx, total_weight);
+
+        let tokens = vec![
+            edge_ab.from_token,
+            edge_ab.to_token,
+            edge_bc.to_token,
+            edge_ca.to_token, // Возврат к началу
+        ];
+
+        Ok(Some(ArbitrageCycle {
+            tokens,
+            total_weight,
+        }))
+    }
+
+    /// Получение подписи цикла для дедупликации
+    fn get_cycle_signature(&self, cycle: &ArbitrageCycle) -> String {
+        let mut tokens_str: Vec<String> = cycle.tokens[..cycle.tokens.len()-1]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+
+        tokens_str.sort(); // Сортируем для нормализации
+        tokens_str.join("-")
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/arbitrage/bellman_ford.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/dex_structs.rs ---
+// bot/src/dex_structs.rs
+use solana_sdk::pubkey::Pubkey;
+use std::convert::TryInto;
+use anyhow::{Result, anyhow};
+
+/// Минимальная длина данных для Raydium AMM V4 AmmInfo
+const MIN_AMM_INFO_LEN: usize = 752;
+
+// ПРАВИЛЬНЫЕ ОФСЕТЫ ДЛЯ RAYDIUM AMM V4
+const MARKET_ID_OFFSET: usize = 224;
+const MARKET_PROGRAM_ID_OFFSET: usize = 256;
+const BASE_VAULT_OFFSET: usize = 384;
+const QUOTE_VAULT_OFFSET: usize = 416;
+const BASE_MINT_OFFSET: usize = 632;
+const QUOTE_MINT_OFFSET: usize = 664;
+
+// Дополнительные важные поля
+const STATUS_OFFSET: usize = 0;
+const NONCE_OFFSET: usize = 8;
+const OPEN_ORDERS_OFFSET: usize = 168;
+const TARGET_ORDERS_OFFSET: usize = 200;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmmInfo {
+    pub status: u64,
+    pub nonce: u64,
+    pub market_id: Pubkey,
+    pub market_program_id: Pubkey,
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub base_vault: Pubkey,
+    pub quote_vault: Pubkey,
+    pub open_orders: Pubkey,
+    pub target_orders: Pubkey,
+    pub fees: Fees,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fees {
+    pub swap_fee_numerator: u64,
+    pub swap_fee_denominator: u64,
+}
+
+impl AmmInfo {
+    /// Парсинг AmmInfo из сырых данных аккаунта с правильными офсетами
+    pub fn try_from_slice(data: &[u8]) -> Result<Self> {
+        if data.len() < MIN_AMM_INFO_LEN {
+            return Err(anyhow!(
+                "Недостаточно данных для AmmInfo: {} байт, требуется минимум {}",
+                data.len(),
+                MIN_AMM_INFO_LEN
+            ));
+        }
+
+        let status = read_u64(data, STATUS_OFFSET)?;
+        let nonce = read_u64(data, NONCE_OFFSET)?;
+        let market_id = read_pubkey(data, MARKET_ID_OFFSET)?;
+        let market_program_id = read_pubkey(data, MARKET_PROGRAM_ID_OFFSET)?;
+        let base_mint = read_pubkey(data, BASE_MINT_OFFSET)?;
+        let quote_mint = read_pubkey(data, QUOTE_MINT_OFFSET)?;
+        let base_vault = read_pubkey(data, BASE_VAULT_OFFSET)?;
+        let quote_vault = read_pubkey(data, QUOTE_VAULT_OFFSET)?;
+        let open_orders = read_pubkey(data, OPEN_ORDERS_OFFSET)?;
+        let target_orders = read_pubkey(data, TARGET_ORDERS_OFFSET)?;
+
+        // Упрощенные комиссии (реальные офсеты зависят от версии)
+        let fees = Fees {
+            swap_fee_numerator: 25,     // 0.25% = 25 bps
+            swap_fee_denominator: 10_000,
+        };
+
+        Ok(Self {
+            status,
+            nonce,
+            market_id,
+            market_program_id,
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+            open_orders,
+            target_orders,
+            fees,
+        })
+    }
+}
+
+/// Чтение Pubkey из данных по офсету с проверкой границ
+pub fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
+    if offset + 32 > data.len() {
+        return Err(anyhow!(
+            "Недостаточно данных для Pubkey по офсету {}: нужно еще {} байт, есть {}",
+            offset,
+            32,
+            data.len().saturating_sub(offset)
+        ));
+    }
+
+    let slice = &data[offset..offset + 32];
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(slice);
+
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+/// Чтение u64 (little-endian) из данных по офсету
+pub fn read_u64(data: &[u8], offset: usize) -> Result<u64> {
+    if offset + 8 > data.len() {
+        return Err(anyhow!(
+            "Недостаточно данных для u64 по офсету {}: нужно еще {} байт, есть {}",
+            offset,
+            8,
+            data.len().saturating_sub(offset)
+        ));
+    }
+
+    let slice = &data[offset..offset + 8];
+    let bytes: [u8; 8] = slice.try_into()?;
+    Ok(u64::from_le_bytes(bytes))
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/dex_structs.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/utils/rpc.rs ---
+// bot/src/utils/rpc.rs
+// Утилиты для работы с RPC клиентами Solana
+
+use anyhow::Result;
+use solana_client::{
+    rpc_client::RpcClient,
+    rpc_config::RpcSendTransactionConfig,
+    // УДАЛИТЕ неиспользуемые импорты:
+    // rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+    // client_error::ClientError,
+};
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    transaction::Transaction,
+    signature::Signature,
+};
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::{warn, debug};
+
+/// Конфигурация ретраев для RPC запросов
+pub struct RetryConfig {
+    pub max_retries: usize,
+    pub base_delay_ms: u64,
+    pub exponential_backoff: bool,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay_ms: 500,
+            exponential_backoff: true,
+        }
+    }
+}
+
+/// RPC клиент с множественными endpoints и ретраями
+pub struct MultiRpcClient {
+    primary: RpcClient,
+    fallbacks: Vec<RpcClient>,
+    retry_config: RetryConfig,
+}
+
+impl MultiRpcClient {
+    pub fn new(primary_url: String, fallback_urls: Vec<String>) -> Self {
+        let primary = RpcClient::new_with_commitment(
+            primary_url,
+            CommitmentConfig::confirmed(),
+        );
+
+        let fallbacks: Vec<RpcClient> = fallback_urls
+            .into_iter()
+            .map(|url| RpcClient::new_with_commitment(url, CommitmentConfig::confirmed()))
+            .collect();
+
+        Self {
+            primary,
+            fallbacks,
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Отправка транзакции с ретраями
+    pub async fn send_transaction_with_retry(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<Signature> {
+        let config = RpcSendTransactionConfig {
+            skip_preflight: false,
+            preflight_commitment: Some(CommitmentConfig::confirmed().commitment),
+            ..Default::default()
+        };
+
+        let mut last_error = None;
+
+        // Попытка через primary RPC
+        for attempt in 0..self.retry_config.max_retries {
+            match self.primary.send_transaction_with_config(transaction, config) {
+                Ok(signature) => {
+                    debug!("Транзакция отправлена: {} (попытка {})", signature, attempt + 1);
+                    return Ok(signature);
+                }
+                Err(e) => {
+                    warn!("Ошибка отправки (попытка {}): {}", attempt + 1, e);
+                    last_error = Some(e);
+
+                    if attempt < self.retry_config.max_retries - 1 {
+                        let delay = self.calculate_delay(attempt);
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+
+        // Попытка через fallback RPCs
+        for (idx, fallback) in self.fallbacks.iter().enumerate() {
+            match fallback.send_transaction_with_config(transaction, config) {
+                Ok(signature) => {
+                    debug!("Транзакция отправлена через fallback #{}: {}", idx + 1, signature);
+                    return Ok(signature);
+                }
+                Err(e) => {
+                    warn!("Fallback #{} провалился: {}", idx + 1, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Не удалось отправить транзакцию после {} попыток: {:?}",
+            self.retry_config.max_retries,
+            last_error
+        ))
+    }
+
+    /// Симуляция транзакции с ретраями
+    pub async fn simulate_transaction_with_retry(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<solana_client::rpc_response::RpcSimulateTransactionResult> {
+        let mut last_error = None;
+
+        for attempt in 0..self.retry_config.max_retries {
+            match self.primary.simulate_transaction(transaction) {
+                Ok(result) => return Ok(result.value),
+                Err(e) => {
+                    warn!("Симуляция провалилась (попытка {}): {}", attempt + 1, e);
+                    last_error = Some(e);
+
+                    if attempt < self.retry_config.max_retries - 1 {
+                        let delay = self.calculate_delay(attempt);
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Симуляция провалилась после {} попыток: {:?}",
+            self.retry_config.max_retries,
+            last_error
+        ))
+    }
+
+    /// Расчёт задержки с exponential backoff
+    fn calculate_delay(&self, attempt: usize) -> u64 {
+        if self.retry_config.exponential_backoff {
+            self.retry_config.base_delay_ms * (2_u64.pow(attempt as u32))
+        } else {
+            self.retry_config.base_delay_ms
+        }
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/utils/rpc.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/utils/mod.rs ---
+// bot/src/utils/mod.rs
+pub mod math;
+pub mod rpc;
+
+use anyhow::{Context, Result};
+use solana_sdk::signature::Keypair;
+use std::fs;
+use std::str::FromStr;
+use solana_sdk::pubkey::Pubkey;
+
+/// Загрузка keypair из файла
+pub fn load_keypair_from_file(path: &str) -> Result<Keypair> {
+    let expanded_path = shellexpand::tilde(path).into_owned();
+
+    let keypair_bytes = fs::read(&expanded_path)
+        .context(format!("Не удалось прочитать файл кошелька: {}", expanded_path))?;
+
+    let keypair_data: Vec<u8> = serde_json::from_slice(&keypair_bytes)
+        .context("Неверный формат файла кошелька (ожидается JSON массив байт)")?;
+
+    // ИСПРАВЛЕНИЕ: используем try_from вместо устаревшего from_bytes
+    let keypair = Keypair::try_from(&keypair_data[..])
+        .map_err(|e| anyhow::anyhow!("Не удалось создать keypair из байтов: {}. Убедитесь, что файл содержит 64 байта.", e))?;
+
+    Ok(keypair)
+}
+
+/// Форматирование lamports в SOL с заданной точностью
+pub fn lamports_to_sol(lamports: u64, decimals: usize) -> String {
+    let sol = lamports as f64 / 1_000_000_000.0;
+    format!("{:.decimals$}", sol, decimals = decimals)
+}
+
+/// Конвертация SOL в lamports
+pub fn sol_to_lamports(sol: f64) -> u64 {
+    (sol * 1_000_000_000.0) as u64
+}
+
+/// Проверка валидности Pubkey
+pub fn is_valid_pubkey(address: &str) -> bool {
+    Pubkey::from_str(address).is_ok()
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/utils/mod.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/utils/math.rs ---
+// bot/src/utils/math.rs
+// Математические утилиты для расчётов арбитража
+
+use anyhow::Result;
+
+/// Расчёт выхода свопа по формуле постоянного произведения (AMM)
+///
+/// # Формула
+/// amount_out = (reserve_out * amount_in) / (reserve_in + amount_in)
+///
+/// # Параметры
+/// - reserve_in: Резерв входного токена
+/// - reserve_out: Резерв выходного токена
+/// - amount_in: Количество входного токена
+/// - fee_bps: Комиссия в базисных пунктах (25 = 0.25%)
+pub fn calculate_amm_swap_output(
+    reserve_in: u64,
+    reserve_out: u64,
+    amount_in: u64,
+    fee_bps: u16,
+) -> Result<u64> {
+    if reserve_in == 0 || reserve_out == 0 {
+        anyhow::bail!("Нулевые резервы в пуле");
+    }
+
+    // Применение комиссии к входной сумме
+    let fee_multiplier = 1.0 - (fee_bps as f64 / 10000.0);
+    let amount_in_with_fee = (amount_in as f64) * fee_multiplier;
+
+    // Формула постоянного произведения
+    let numerator = (reserve_out as f64) * amount_in_with_fee;
+    let denominator = (reserve_in as f64) + amount_in_with_fee;
+
+    let amount_out = numerator / denominator;
+
+    Ok(amount_out as u64)
+}
+
+/// Расчёт минимального выхода с учётом slippage
+///
+/// # Параметры
+/// - expected_amount: Ожидаемая сумма
+/// - slippage_bps: Допустимый slippage в базисных пунктах (100 = 1%)
+pub fn calculate_minimum_amount_out(
+    expected_amount: u64,
+    slippage_bps: u16,
+) -> u64 {
+    let slippage_multiplier = 1.0 - (slippage_bps as f64 / 10000.0);
+    ((expected_amount as f64) * slippage_multiplier) as u64
+}
+
+/// Расчёт цены токена A в терминах токена B
+pub fn calculate_price_a_to_b(reserve_a: u64, reserve_b: u64) -> f64 {
+    if reserve_b == 0 {
+        return 0.0;
+    }
+    reserve_a as f64 / reserve_b as f64
+}
+
+/// Расчёт изменения цены в процентах
+pub fn calculate_price_change_percent(old_price: f64, new_price: f64) -> f64 {
+    if old_price == 0.0 {
+        return 0.0;
+    }
+    ((new_price - old_price) / old_price) * 100.0
+}
+
+/// Расчёт прибыли в процентах
+pub fn calculate_profit_percentage(initial: u64, final_amount: u64) -> f64 {
+    if initial == 0 {
+        return 0.0;
+    }
+    ((final_amount as f64 - initial as f64) / initial as f64) * 100.0
+}
+
+/// Проверка прибыльности с учётом минимального порога
+pub fn is_profitable(
+    initial_amount: u64,
+    final_amount: u64,
+    min_profit_lamports: u64,
+) -> bool {
+    final_amount >= initial_amount + min_profit_lamports
+}
+
+/// Расчёт общих комиссий транзакции
+pub fn calculate_total_transaction_fees(
+    base_fee: u64,
+    priority_fee: u64,
+    jito_tip: u64,
+) -> u64 {
+    base_fee + priority_fee + jito_tip
+}
+
+/// Расчёт точки безубыточности (breakeven) для арбитража
+///
+/// Возвращает минимальную финальную сумму для достижения нулевой прибыли
+pub fn calculate_breakeven_amount(
+    initial_amount: u64,
+    transaction_fees: u64,
+) -> u64 {
+    initial_amount + transaction_fees
+}
+
+/// Расчёт эффективной APY для арбитража
+///
+/// # Параметры
+/// - profit_lamports: Прибыль за одну сделку
+/// - capital_lamports: Использованный капитал
+/// - trades_per_day: Среднее количество сделок в день
+pub fn calculate_effective_apy(
+    profit_lamports: u64,
+    capital_lamports: u64,
+    trades_per_day: f64,
+) -> f64 {
+    if capital_lamports == 0 {
+        return 0.0;
+    }
+
+    let daily_return = (profit_lamports as f64 / capital_lamports as f64) * trades_per_day;
+    let annual_return = daily_return * 365.0;
+
+    annual_return * 100.0 // В процентах
+}
+
+/// Расчёт impact на пул (price impact от свопа)
+pub fn calculate_price_impact(
+    reserve_in: u64,
+    reserve_out: u64,
+    amount_in: u64,
+) -> f64 {
+    let price_before = reserve_out as f64 / reserve_in as f64;
+    let new_reserve_in = reserve_in + amount_in;
+    let price_after = reserve_out as f64 / new_reserve_in as f64;
+
+    ((price_after - price_before) / price_before).abs() * 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_amm_swap_output() {
+        // Пул: 1000 USDC, 1000 SOL, комиссия 0.25%
+        let output = calculate_amm_swap_output(
+            1_000_000_000, // 1000 USDC
+            1_000_000_000, // 1000 SOL
+            100_000_000,   // 100 USDC in
+            25,            // 0.25% fee
+        ).unwrap();
+
+        // Ожидаем ~90.7 SOL (с учётом комиссии и slippage)
+        assert!(output > 90_000_000 && output < 100_000_000);
+    }
+
+    #[test]
+    fn test_minimum_amount_out() {
+        let expected = 1_000_000_000; // 1 SOL
+        let min_out = calculate_minimum_amount_out(expected, 100); // 1% slippage
+
+        assert_eq!(min_out, 990_000_000); // 0.99 SOL
+    }
+
+    #[test]
+    fn test_price_change() {
+        let change = calculate_price_change_percent(100.0, 110.0);
+        assert!((change - 10.0).abs() < 0.01);
+
+        let change_down = calculate_price_change_percent(100.0, 90.0);
+        assert!((change_down + 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_profitability_check() {
+        assert!(is_profitable(1_000_000, 1_100_000, 50_000)); // Прибыльно
+        assert!(!is_profitable(1_000_000, 1_040_000, 50_000)); // Не прибыльно
+    }
+
+    #[test]
+    fn test_apy_calculation() {
+        // Прибыль 0.01 SOL с капитала 1 SOL, 10 сделок в день
+        let apy = calculate_effective_apy(
+            10_000_000,   // 0.01 SOL profit
+            1_000_000_000, // 1 SOL capital
+            10.0,         // 10 trades/day
+        );
+
+        // Ожидаем ~36.5% годовых
+        assert!((apy - 36.5).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_price_impact() {
+        let impact = calculate_price_impact(
+            1_000_000_000, // 1000 tokens in reserve
+            1_000_000_000, // 1000 tokens out reserve
+            100_000_000,   // 100 tokens swap
+        );
+
+        // Impact должен быть ~9.09%
+        assert!(impact > 9.0 && impact < 10.0);
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/utils/math.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/types.rs ---
+// bot/src/types.rs
+// Shared types and structures
+
+use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DexProtocol {
+    RaydiumAmmV4,
+    RaydiumCpmm,
+    RaydiumClmm,
+    MeteoraDlmm,
+}
+
+impl fmt::Display for DexProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DexProtocol::RaydiumAmmV4 => write!(f, "Raydium AMM V4"),
+            DexProtocol::RaydiumCpmm => write!(f, "Raydium CPMM"),
+            DexProtocol::RaydiumClmm => write!(f, "Raydium CLMM"),
+            DexProtocol::MeteoraDlmm => write!(f, "Meteora DLMM"),
+        }
+    }
+}
+
+/// Pool state data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolState {
+    pub id: Pubkey,
+    pub protocol: DexProtocol,
+    pub token_a: Pubkey,
+    pub token_b: Pubkey,
+    pub reserve_a: u64,
+    pub reserve_b: u64,
+    pub fee_bps: u16,
+    pub last_updated: i64,
+    pub full_state_data: Vec<u8>,
+    pub decimals_a: u8,
+    pub decimals_b: u8,
+}
+
+impl PoolState {
+    pub fn price_a_to_b(&self) -> f64 {
+        if self.reserve_b == 0 {
+            return 0.0;
+        }
+        self.reserve_a as f64 / self.reserve_b as f64
+    }
+
+    pub fn price_b_to_a(&self) -> f64 {
+        if self.reserve_a == 0 {
+            return 0.0;
+        }
+        self.reserve_b as f64 / self.reserve_a as f64
+    }
+}
+
+/// Single swap leg in arbitrage route
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapLeg {
+    pub protocol: DexProtocol,
+    pub pool_id: Pubkey,
+    pub input_mint: Pubkey,
+    pub output_mint: Pubkey,
+    pub amount_in: u64,
+    pub minimum_amount_out: u64,
+    pub estimated_amount_out: u64,
+    pub fee_bps: u16,
+    pub pool_state_data: Vec<u8>,
+}
+
+/// Complete arbitrage opportunity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArbitrageOpportunity {
+    pub legs: Vec<SwapLeg>,
+    pub initial_amount: u64,
+    pub expected_final_amount: u64,
+    pub gross_profit: u64,
+    pub net_profit: u64,
+    pub profit_percentage: f64,
+    pub discovered_at: i64,
+}
+
+impl ArbitrageOpportunity {
+    pub fn is_profitable(&self, min_profit: u64) -> bool {
+        self.net_profit >= min_profit
+    }
+}
+
+/// Price edge in graph
+#[derive(Debug, Clone, Copy)]
+pub struct PriceEdge {
+    pub from_token: Pubkey,
+    pub to_token: Pubkey,
+    pub pool_id: Pubkey,
+    pub protocol: DexProtocol,
+    pub weight: f64, // -log(exchange_rate) for Bellman-Ford
+    pub fee_bps: u16,
+}
+
+pub struct SimulationResult {
+    pub err: Option<String>,
+    pub logs: Vec<String>,
+    pub units_consumed: Option<u64>,
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/types.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/token_factory.rs ---
+// bot/src/test_setup/token_factory.rs
+use anyhow::{Result, Context};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    signature::{Keypair, Signer},
+    transaction::Transaction,
+    system_instruction, // Оставляем старый импорт для совместимости
+    pubkey::Pubkey,
+};
+use spl_token::{
+    instruction as token_instruction,
+    state::Mint,
+};
+use spl_associated_token_account::instruction as associated_token_instruction;
+use solana_program_pack::Pack; // ДОБАВЛЕН ИМПОРТ
+use std::sync::Arc;
+use tracing::info;
+
+use super::TestToken;
+
+pub struct TokenFactory {
+    rpc_client: Arc<RpcClient>,
+    payer: Arc<Keypair>,
+}
+
+impl TokenFactory {
+    pub fn new(rpc_client: Arc<RpcClient>, payer: Arc<Keypair>) -> Self {
+        Self { rpc_client, payer }
+    }
+
+    /// Создает новый SPL-токен с заданными параметрами
+    pub async fn create_token(
+        &self,
+        symbol: &str,
+        decimals: u8,
+        initial_supply: u64,
+    ) -> Result<TestToken> {
+        info!("🏭 Создание токена {}...", symbol);
+
+        // 1. Создаем новый mint keypair
+        let mint_keypair = Keypair::new();
+        let mint_pubkey = mint_keypair.pubkey();
+
+        // 2. Рассчитываем размер и стоимость аренды для mint аккаунта
+        let mint_rent = self.rpc_client
+            .get_minimum_balance_for_rent_exemption(<Mint as Pack>::LEN)?;
+
+        // 3. Создаем associated token account для владельца
+        let owner_ata = spl_associated_token_account::get_associated_token_address(
+            &self.payer.pubkey(),
+            &mint_pubkey,
+        );
+
+        // 4. Создаем и отправляем транзакцию
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                // Создаем аккаунт для mint
+                system_instruction::create_account(
+                    &self.payer.pubkey(),
+                    &mint_pubkey,
+                    mint_rent,
+                    <Mint as Pack>::LEN as u64,
+                    &spl_token::id(),
+                ),
+                // Инициализируем mint
+                token_instruction::initialize_mint(
+                    &spl_token::id(),
+                    &mint_pubkey,
+                    &self.payer.pubkey(), // mint authority
+                    Some(&self.payer.pubkey()), // freeze authority
+                    decimals,
+                )?,
+                // Создаем associated token account
+                associated_token_instruction::create_associated_token_account(
+                    &self.payer.pubkey(),
+                    &self.payer.pubkey(),
+                    &mint_pubkey,
+                    &spl_token::id(),
+                ),
+                // Минтим начальное количество токенов
+                token_instruction::mint_to(
+                    &spl_token::id(),
+                    &mint_pubkey,
+                    &owner_ata,
+                    &self.payer.pubkey(),
+                    &[],
+                    initial_supply * 10_u64.pow(decimals as u32),
+                )?,
+            ],
+            Some(&self.payer.pubkey()),
+            &[&self.payer, &mint_keypair],
+            recent_blockhash,
+        );
+
+        let signature = self.rpc_client.send_and_confirm_transaction(&transaction)?;
+        info!("   ✅ Токен {} создан: {} (tx: {})", symbol, mint_pubkey, signature);
+
+        Ok(TestToken {
+            mint: mint_pubkey,
+            account: owner_ata,
+            decimals,
+            symbol: symbol.to_string(),
+        })
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/token_factory.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/script_executor.rs ---
+// bot/src/test_setup/script_executor.rs
+use anyhow::{Result, Context};
+use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::str::FromStr;
+use tracing::{info, warn};
+
+use crate::types::PoolState;
+
+pub struct ScriptExecutor {
+    scripts_dir: PathBuf
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScriptTestToken {
+    pub mint: String,
+    pub account: String,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScriptPool {
+    pub id: String,
+    pub protocol: String,
+    #[serde(rename = "tokenA")]
+    pub token_a: String,
+    #[serde(rename = "tokenB")]
+    pub token_b: String,
+    #[serde(rename = "priceRatio")]
+    pub price_ratio: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScriptEnvironmentResult {
+    #[serde(rename = "tokenA")]
+    pub token_a: ScriptTestToken,
+    #[serde(rename = "tokenB")]
+    pub token_b: ScriptTestToken,
+    #[serde(rename = "marketId")]
+    pub market_id: String,
+    pub pools: Vec<ScriptPool>,
+}
+
+impl ScriptExecutor {
+    pub fn new() -> Self {
+        // Вычисляем корень проекта по бинарю и поднимаясь вверх до Cargo.toml
+        let project_root = resolve_project_root().unwrap_or_else(|_| std::env::current_dir().unwrap());
+        let scripts_dir = project_root.join("bot").join("scripts");
+        Self { scripts_dir }
+    }
+
+    pub async fn setup_test_environment(&self) -> Result<Vec<PoolState>> {
+        info!("🚀 Запуск создания тестовой среды через TypeScript скрипты...");
+
+        self.ensure_scripts_ready()?;
+        self.install_dependencies().await?;
+        let result = self.execute_setup_script().await?;
+        let pools = self.convert_to_pool_states(result)?;
+        info!("✅ Тестовая среда создана через TypeScript: {} пулов", pools.len());
+        Ok(pools)
+    }
+
+    fn ensure_scripts_ready(&self) -> Result<()> {
+        let pkg = self.scripts_dir.join("package.json");
+        if !pkg.exists() {
+            return Err(anyhow::anyhow!(
+                "Отсутствует файл скрипта: {}. Убедитесь, что все TypeScript скрипты созданы.",
+                pkg.display()
+            ));
+        }
+        let src = self.scripts_dir.join("src");
+        if !src.exists() {
+            return Err(anyhow::anyhow!(
+                "Отсутствует директория скриптов: {}",
+                src.display()
+            ));
+        }
+        info!("📁 Скрипты найдены: {}", self.scripts_dir.display());
+        Ok(())
+    }
+
+    async fn install_dependencies(&self) -> Result<()> {
+        info!("📦 Проверка зависимостей npm...");
+        let node_modules = self.scripts_dir.join("node_modules");
+        if node_modules.exists() {
+            info!("   ✅ node_modules уже существует");
+            return Ok(());
+        }
+        info!("   📥 Устанавливаем зависимости (npm install)...");
+
+        let status = Command::new("npm")
+            .arg("install")
+            .current_dir(&self.scripts_dir) // ВАЖНО: рабочая директория = bot/scripts
+            .status()
+            .context("Не удалось запустить npm install")?;
+
+        if !status.success() {
+            anyhow::bail!("npm install завершился с ошибкой (status: {})", status);
+        }
+        info!("   ✅ Зависимости установлены");
+        Ok(())
+    }
+
+    async fn execute_setup_script(&self) -> Result<ScriptEnvironmentResult> {
+        info!("🎬 Выполнение setupTestEnvironment.ts...");
+        // npm run build && node dist/setupTestEnvironment.js
+        let status_build = Command::new("npm")
+            .args(["run", "build"])
+            .current_dir(&self.scripts_dir)
+            .status()
+            .context("Не удалось запустить npm run build")?;
+        if !status_build.success() {
+            anyhow::bail!("npm run build завершился с ошибкой");
+        }
+
+        let output = Command::new("node")
+            .arg("dist/setupTestEnvironment.js")
+            .current_dir(&self.scripts_dir)
+            .output()
+            .context("Не удалось запустить setupTestEnvironment.js")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            warn!("TypeScript скрипт завершился с ошибкой:\nSTDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
+            anyhow::bail!("setupTestEnvironment.js завершился с ошибкой");
+        }
+
+        info!("📄 Вывод скрипта:\n{}", stdout);
+
+        let json_start = stdout.find('{').ok_or_else(|| anyhow::anyhow!("Не найден JSON результат в выводе скрипта"))?;
+        let json_str = &stdout[json_start..];
+        let result: ScriptEnvironmentResult = serde_json::from_str(json_str)
+            .context("Не удалось распарсить JSON результат от TypeScript скрипта")?;
+
+        Ok(result)
+    }
+
+    fn convert_to_pool_states(&self, result: ScriptEnvironmentResult) -> Result<Vec<PoolState>> {
+        let mut pools = Vec::new();
+
+        for script_pool in result.pools {
+            let protocol = match script_pool.protocol.as_str() {
+                "RaydiumAmmV4" => crate::types::DexProtocol::RaydiumAmmV4,
+                "RaydiumCpmm" => crate::types::DexProtocol::RaydiumCpmm,
+                "RaydiumClmm" => crate::types::DexProtocol::RaydiumClmm,
+                "MeteoraDlmm" => crate::types::DexProtocol::MeteoraDlmm,
+                _ => {
+                    warn!("Неизвестный протокол: {}", script_pool.protocol);
+                    continue;
+                }
+            };
+
+            let pool_state = PoolState {
+                id: Pubkey::from_str(&script_pool.id)?,
+                protocol,
+                token_a: Pubkey::from_str(&script_pool.token_a)?,
+                token_b: Pubkey::from_str(&script_pool.token_b)?,
+                reserve_a: 1_000_000_000, // Будет обновлено при сканировании
+                reserve_b: (1_000_000_000.0 * script_pool.price_ratio) as u64,
+                fee_bps: match protocol {
+                    crate::types::DexProtocol::RaydiumAmmV4 => 25,
+                    crate::types::DexProtocol::RaydiumCpmm => 25,
+                    crate::types::DexProtocol::RaydiumClmm => 30,
+                    crate::types::DexProtocol::MeteoraDlmm => 50,
+                },
+                last_updated: chrono::Utc::now().timestamp(),
+                full_state_data: Vec::new(),
+            };
+
+            pools.push(pool_state);
+        }
+
+        Ok(pools)
+    }
+
+    /// Создает единичный OpenBook рынок
+    pub async fn create_market(
+        &self,
+        base_mint: &Pubkey,
+        quote_mint: &Pubkey,
+        base_decimals: u8,
+        quote_decimals: u8,
+    ) -> Result<Pubkey> {
+        info!("📈 Создание OpenBook рынка через TypeScript...");
+
+        let output = Command::new("npm")
+            .arg("run")
+            .arg("create-market")
+            .arg(base_mint.to_string())
+            .arg(quote_mint.to_string())
+            .arg(base_decimals.to_string())
+            .arg(quote_decimals.to_string())
+            .current_dir(&self.scripts_dir)
+            .env("WALLET_PATH", std::env::var("WALLET_PATH").unwrap_or_else(|_| "~/.config/solana/id.json".to_string()))
+            .env("SOLANA_CLUSTER", "devnet")
+            .output()
+            .context("Не удалось запустить create-market скрипт")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!(
+                "create-market завершился с ошибкой:\n{}",
+                stderr
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Ищем строку SUCCESS: в выводе
+        if let Some(success_line) = stdout.lines().find(|line| line.starts_with("SUCCESS:")) {
+            let market_id_str = success_line.trim_start_matches("SUCCESS:").trim();
+            let market_id = Pubkey::from_str(market_id_str)
+                .context("Не удалось распарсить market ID")?;
+
+            info!("✅ OpenBook рынок создан: {}", market_id);
+            return Ok(market_id);
+        }
+
+        Err(anyhow::anyhow!("Не найден SUCCESS в выводе create-market"))
+    }
+}
+
+impl Default for ScriptExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+fn resolve_project_root() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let mut dir = exe.parent().ok_or_else(|| anyhow::anyhow!("Нет родительской директории у бинаря"))?.to_path_buf();
+    // Поднимаемся вверх, пока не найдем Cargo.toml
+    for _ in 0..5 {
+        if dir.join("Cargo.toml").exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    anyhow::bail!("Не удалось найти корень проекта (Cargo.toml)");
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/script_executor.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/pool_creator.rs ---
+// bot/src/test_setup/pool_creator.rs
+use anyhow::{Result, Context};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    signature::{Keypair, Signer},
+    pubkey::Pubkey,
+};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use crate::{config::BotConfig, types::{PoolState, DexProtocol}};
+use super::TestToken;
+
+pub struct PoolCreator {
+    rpc_client: Arc<RpcClient>,
+    config: Arc<BotConfig>,
+    payer: Arc<Keypair>,
+}
+
+impl PoolCreator {
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        config: Arc<BotConfig>,
+        payer: Arc<Keypair>,
+    ) -> Self {
+        Self {
+            rpc_client,
+            config,
+            payer,
+        }
+    }
+
+    /// Создает Raydium AMM V4 пул
+    pub async fn create_raydium_amm_v4_pool(
+        &self,
+        token_a: &TestToken,
+        token_b: &TestToken,
+        market_id: Pubkey,
+        price_ratio: f64,
+    ) -> Result<PoolState> {
+        info!("🏊‍♂️ Создание Raydium AMM V4 пула (цена: {})", price_ratio);
+
+        warn!("⚠️  ЗАГЛУШКА: Используйте raydium-sdk-V2-demo/src/amm/createPool.ts");
+        warn!("   Для полной реализации требуется интеграция с Raydium SDK");
+
+        // Создаем фиктивный пул для тестирования логики бота
+        let fake_pool_id = Pubkey::create_with_seed(
+            &self.payer.pubkey(),
+            &format!("ammv4_{}", price_ratio),
+            &self.config.dex.raydium_amm_v4.to_pubkey()?,
+        )?;
+
+        Ok(PoolState {
+            id: fake_pool_id,
+            protocol: DexProtocol::RaydiumAmmV4,
+            token_a: token_a.mint,
+            token_b: token_b.mint,
+            reserve_a: 1_000_000 * 10_u64.pow(token_a.decimals as u32),
+            reserve_b: ((1_000_000.0 * price_ratio) as u64) * 10_u64.pow(token_b.decimals as u32),
+            fee_bps: 25,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+        })
+    }
+
+    pub async fn create_raydium_cpmm_pool(
+        &self,
+        token_a: &TestToken,
+        token_b: &TestToken,
+        price_ratio: f64,
+    ) -> Result<PoolState> {
+        info!("🔄 Создание Raydium CPMM пула (цена: {})", price_ratio);
+
+        let fake_pool_id = Pubkey::create_with_seed(
+            &self.payer.pubkey(),
+            &format!("cpmm_{}", price_ratio),
+            &self.config.dex.raydium_cpmm.to_pubkey()?,
+        )?;
+
+        Ok(PoolState {
+            id: fake_pool_id,
+            protocol: DexProtocol::RaydiumCpmm,
+            token_a: token_a.mint,
+            token_b: token_b.mint,
+            reserve_a: 500_000 * 10_u64.pow(token_a.decimals as u32),
+            reserve_b: ((500_000.0 * price_ratio) as u64) * 10_u64.pow(token_b.decimals as u32),
+            fee_bps: 25,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+        })
+    }
+
+    pub async fn create_raydium_clmm_pool(
+        &self,
+        token_a: &TestToken,
+        token_b: &TestToken,
+        price_ratio: f64,
+    ) -> Result<PoolState> {
+        info!("🌊 Создание Raydium CLMM пула (цена: {})", price_ratio);
+
+        let fake_pool_id = Pubkey::create_with_seed(
+            &self.payer.pubkey(),
+            &format!("clmm_{}", price_ratio),
+            &self.config.dex.raydium_clmm.to_pubkey()?,
+        )?;
+
+        Ok(PoolState {
+            id: fake_pool_id,
+            protocol: DexProtocol::RaydiumClmm,
+            token_a: token_a.mint,
+            token_b: token_b.mint,
+            reserve_a: 750_000 * 10_u64.pow(token_a.decimals as u32),
+            reserve_b: ((750_000.0 * price_ratio) as u64) * 10_u64.pow(token_b.decimals as u32),
+            fee_bps: 30,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+        })
+    }
+
+    pub async fn create_meteora_dlmm_pool(
+        &self,
+        token_a: &TestToken,
+        token_b: &TestToken,
+        price_ratio: f64,
+    ) -> Result<PoolState> {
+        info!("⭐ Создание Meteora DLMM пула (цена: {})", price_ratio);
+
+        let fake_pool_id = Pubkey::create_with_seed(
+            &self.payer.pubkey(),
+            &format!("dlmm_{}", price_ratio),
+            &self.config.dex.meteora_dlmm.to_pubkey()?,
+        )?;
+
+        Ok(PoolState {
+            id: fake_pool_id,
+            protocol: DexProtocol::MeteoraDlmm,
+            token_a: token_a.mint,
+            token_b: token_b.mint,
+            reserve_a: 600_000 * 10_u64.pow(token_a.decimals as u32),
+            reserve_b: ((600_000.0 * price_ratio) as u64) * 10_u64.pow(token_b.decimals as u32),
+            fee_bps: 50,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+        })
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/pool_creator.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/mod.rs ---
+// bot/src/test_setup/mod.rs
+pub mod token_factory;
+
+use anyhow::Result;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::pubkey::Pubkey;
+use std::sync::Arc;
+use tracing::info;
+
+use crate::config::BotConfig;
+use crate::types::{PoolState, DexProtocol};
+use token_factory::TokenFactory;
+
+/// Структура тестового токена
+#[derive(Debug, Clone)]
+pub struct TestToken {
+    pub mint: Pubkey,
+    pub account: Pubkey,
+    pub decimals: u8,
+    pub symbol: String,
+}
+
+/// Результат создания тестовой среды
+#[derive(Debug)]
+pub struct TestEnvironmentResult {
+    pub token_a: TestToken,
+    pub token_b: TestToken,
+    pub token_c: TestToken,
+    pub market_id: Pubkey,
+    pub pools: Vec<PoolState>,
+}
+
+/// Основной контроллер для создания изолированной тестовой среды
+pub struct TestEnvironmentSetup {
+    rpc_client: Arc<RpcClient>,
+    config: Arc<BotConfig>,
+    keypair: Arc<Keypair>,
+    token_factory: TokenFactory,
+}
+
+impl TestEnvironmentSetup {
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        config: Arc<BotConfig>,
+        keypair: Arc<Keypair>,
+    ) -> Self {
+        Self {
+            token_factory: TokenFactory::new(rpc_client.clone(), keypair.clone()),
+            rpc_client,
+            config,
+            keypair,
+        }
+    }
+
+    /// Публичная точка входа: создаёт трёхтокенную среду и треугольник пулов (fallback на Rust)
+    pub async fn create_test_environment(&self) -> Result<TestEnvironmentResult> {
+        info!("🏗️ Создание тестовой среды (fallback на Rust, 3 токена / 3 пула)");
+
+        let (token_a, token_b, token_c) = self.create_test_tokens().await?;
+        let market_id = self.create_openbook_market(&token_a, &token_b).await?;
+        let pools = self.create_arbitrage_pools_triangle(&token_a, &token_b, &token_c, market_id).await?;
+
+        Ok(TestEnvironmentResult {
+            token_a,
+            token_b,
+            token_c,
+            market_id,
+            pools,
+        })
+    }
+
+    /// Создание трёх тестовых токенов: TESTA(9), TESTB(6), TESTC(9)
+    pub async fn create_test_tokens(&self) -> Result<(TestToken, TestToken, TestToken)> {
+        info!("🪙 Создание тестовых токенов...");
+        let token_a = self.token_factory.create_token("TESTA", 9, 1_000_000).await?;
+        let token_b = self.token_factory.create_token("TESTB", 6, 1_000_000).await?;
+        let token_c = self.token_factory.create_token("TESTC", 9, 1_000_000).await?;
+        Ok((token_a, token_b, token_c))
+    }
+
+    /// Заглушка: создаём детерминированный OpenBook рынок для пары A/B
+    pub async fn create_openbook_market(&self, token_a: &TestToken, token_b: &TestToken) -> Result<Pubkey> {
+        info!("📈 Создание OpenBook рынка (заглушка)...");
+        let (market, _bump) = Pubkey::find_program_address(
+            &[
+                b"openbook_market",
+                token_a.mint.as_ref(),
+                token_b.mint.as_ref()
+            ],
+            &self.config.dex.openbook_id.to_pubkey()?,
+        );
+        Ok(market)
+    }
+
+    /// Создание треугольника пулов с явными резервами:
+    /// A/B (AMM V4, 25bps), B/C (CPMM, 25bps), C/A (DLMM, 50bps)
+    pub async fn create_arbitrage_pools_triangle(
+        &self,
+        token_a: &TestToken,
+        token_b: &TestToken,
+        token_c: &TestToken,
+        market_ab: Pubkey,
+    ) -> Result<Vec<PoolState>> {
+        // Цены (после комиссий дают > 50 bps чистой прибыли)
+        let p_ab = 1.0025_f64; // B per A
+        let p_bc = 1.0050_f64; // C per B
+        let p_ca = 1.0080_f64; // A per C
+        let l_ui = 10_000_f64;
+
+        let pow10 = |d: u8| -> u64 { 10u64.pow(d as u32) };
+
+        // A/B
+        let reserve_a_ab = (l_ui * pow10(token_a.decimals) as f64) as u64;
+        let reserve_b_ab = (l_ui * p_ab * pow10(token_b.decimals) as f64) as u64;
+
+        // B/C
+        let reserve_b_bc = (l_ui * pow10(token_b.decimals) as f64) as u64;
+        let reserve_c_bc = (l_ui * p_bc * pow10(token_c.decimals) as f64) as u64;
+
+        // C/A
+        let reserve_c_ca = (l_ui * pow10(token_c.decimals) as f64) as u64;
+        let reserve_a_ca = (l_ui * p_ca * pow10(token_a.decimals) as f64) as u64;
+
+        // Детерминированные PDA пулов
+        let (pool_ab_id, _) = Pubkey::find_program_address(
+            &[
+                b"pool_ab",
+                token_a.mint.as_ref(),
+                token_b.mint.as_ref(),
+                market_ab.as_ref(),
+            ],
+            &self.config.dex.raydium_amm_v4.to_pubkey()?,
+        );
+        let (pool_bc_id, _) = Pubkey::find_program_address(
+            &[
+                b"pool_bc",
+                token_b.mint.as_ref(),
+                token_c.mint.as_ref(),
+            ],
+            &self.config.dex.raydium_cpmm.to_pubkey()?,
+        );
+        let (pool_ca_id, _) = Pubkey::find_program_address(
+            &[
+                b"pool_ca",
+                token_c.mint.as_ref(),
+                token_a.mint.as_ref(),
+            ],
+            &self.config.dex.meteora_dlmm.to_pubkey()?,
+        );
+
+        let pool_ab = PoolState {
+            id: pool_ab_id,
+            protocol: DexProtocol::RaydiumAmmV4,
+            token_a: token_a.mint,
+            token_b: token_b.mint,
+            reserve_a: reserve_a_ab,
+            reserve_b: reserve_b_ab,
+            fee_bps: 25,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+            decimals_a: token_a.decimals,
+            decimals_b: token_b.decimals,
+        };
+
+        let pool_bc = PoolState {
+            id: pool_bc_id,
+            protocol: DexProtocol::RaydiumCpmm,
+            token_a: token_b.mint,
+            token_b: token_c.mint,
+            reserve_a: reserve_b_bc,
+            reserve_b: reserve_c_bc,
+            fee_bps: 25,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+            decimals_a: token_b.decimals,
+            decimals_b: token_c.decimals,
+        };
+
+
+        let pool_ca = PoolState {
+            id: pool_ca_id,
+            protocol: DexProtocol::MeteoraDlmm,
+            token_a: token_c.mint,
+            token_b: token_a.mint,
+            reserve_a: reserve_c_ca,
+            reserve_b: reserve_a_ca,
+            fee_bps: 50,
+            last_updated: chrono::Utc::now().timestamp(),
+            full_state_data: Vec::new(),
+            decimals_a: token_c.decimals,
+            decimals_b: token_a.decimals,
+        };
+
+        info!("🧮 Пулы A/B, B/C, C/A созданы с явными резервами");
+        Ok(vec![pool_ab, pool_bc, pool_ca])
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/mod.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/market_creator.rs ---
+// bot/src/test_setup/market_creator.rs
+use anyhow::{Result, Context};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    signature::{Keypair, Signer},
+    pubkey::Pubkey,
+};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+pub struct MarketCreator {
+    rpc_client: Arc<RpcClient>,
+    payer: Arc<Keypair>,
+}
+
+impl MarketCreator {
+    pub fn new(rpc_client: Arc<RpcClient>, payer: Arc<Keypair>) -> Self {
+        Self { rpc_client, payer }
+    }
+
+    /// Создает OpenBook рынок для пары токенов
+    pub async fn create_market(
+        &self,
+        base_mint: &Pubkey,
+        quote_mint: &Pubkey,
+    ) -> Result<Pubkey> {
+        info!("📈 Создание OpenBook рынка для пары {}/{}...", base_mint, quote_mint);
+
+        warn!("⚠️  ЗАГЛУШКА: Для реального создания рынка используйте:");
+        warn!("   npm install @raydium-io/raydium-sdk-v2");
+        warn!("   Затем адаптируйте createMarket.ts из raydium-sdk-V2-demo");
+
+        // Генерируем детерминистический fake market ID для тестирования
+        let fake_market_id = Pubkey::create_with_seed(
+            &self.payer.pubkey(),
+            "test_market",
+            &crate::config::BotConfig::load()?.dex.openbook_id.to_pubkey()?,
+        )?;
+
+        info!("   ✅ OpenBook рынок (заглушка): {}", fake_market_id);
+
+        Ok(fake_market_id)
+    }
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/src/test_setup/market_creator.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/bot/Cargo.toml ---
+# bot/Cargo.toml
+[package]
+name = "arbitrage-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arbitrage-executor = { path = "../programs/arbitrage-executor" }
+
+solana-program = { workspace = true }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-transaction-status = { workspace = true }
+solana-program-pack = { workspace = true }
+
+anchor-client = { workspace = true }
+anchor-spl = { workspace = true }
+borsh = { workspace = true }
+anchor-lang = { workspace = true }
+solana-system-interface = { version = "2.0.0" }
+
+tokio = { workspace = true }
+futures = "0.3"
+async-trait = "0.1"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+reqwest = { workspace = true }
+dotenv = "0.15"
+
+
+bs58 = { workspace = true }
+rayon = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+shellexpand = { workspace = true }
+once_cell = { workspace = true }
+lru = { workspace = true }
+
+
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }
+bytemuck = { version = "1.14", features = ["derive"] }
+--- End File: /home/newvovi5/arbitrage-bot-rust/bot/Cargo.toml ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/Cargo.toml ---
+[workspace]
+members = [
+    "programs/arbitrage-executor",
+    "bot",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Современные версии для nightly Rust
+solana-sdk = "2.3.0"
+solana-client = "2.3.0"
+solana-program = "2.3.0"
+solana-account-decoder = "2.3.0"
+solana-transaction-status = "2.3.0"
+solana-system-interface = "2.0.0"
+solana-program-pack = "2.2.1"
+
+anchor-lang = "0.31.0"
+anchor-spl = "0.31.0"
+anchor-client = "0.31.0"
+
+# --- ОБНОВЛЕННЫЕ ВЕРСИИ ---
+borsh = "1.5.1"
+spl-token = "6.0.0"
+spl-associated-token-account = "6.0.0"
+
+# --- РАСКОММЕНТИРОВАННЫЕ ЗАВИСИМОСТИ БОТА ---
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+bs58 = "0.5"
+rayon = "1.10"
+dashmap = "5.5"
+chrono = "0.4"
+shellexpand = "3.1"
+once_cell = "1.21.3"
+lru = "0.12"
+futures = "0.3"
+async-trait = "0.1"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+
+
+[profile.release]
+overflow-checks = true
+--- End File: /home/newvovi5/arbitrage-bot-rust/Cargo.toml ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/create-test-pool.js ---
+// create-test-pool.js
+const { Connection, Keypair, PublicKey, Transaction } = require('@solana/web3.js');
+const {
+    createMint,
+    createAccount,
+    mintTo,
+    TOKEN_PROGRAM_ID
+} = require('@solana/spl-token');
+const {
+    AmmV4,
+    ApiPoolInfoV4,
+    LiquidityPoolKeys,
+    MARKET_STATE_LAYOUT_V3,
+    Market,
+    TOKEN_PROGRAM_ID: RAYDIUM_TOKEN_PROGRAM_ID
+} = require('@raydium-io/raydium-sdk-v2');
+const fs = require('fs');
+
+const RPC_ENDPOINT = 'https://api.devnet.solana.com';
+const connection = new Connection(RPC_ENDPOINT, 'confirmed');
+
+// Загружаем кошелек
+const keypairData = JSON.parse(fs.readFileSync(process.env.HOME + '/.config/solana/id.json'));
+const wallet = Keypair.fromSecretKey(new Uint8Array(keypairData));
+
+console.log('🔑 Кошелек:', wallet.publicKey.toString());
+
+async function createTestPool() {
+    try {
+        console.log('🏗️ Создание тестового пула на devnet...');
+
+        // Шаг 1: Создание тестовых токенов
+        console.log('📄 Создание тестовых токенов...');
+
+        const tokenA = await createMint(
+            connection,
+            wallet,
+            wallet.publicKey,
+            null,
+            9, // decimals
+            TOKEN_PROGRAM_ID
+        );
+
+        const tokenB = await createMint(
+            connection,
+            wallet,
+            wallet.publicKey,
+            null,
+            6, // decimals (как USDC)
+            TOKEN_PROGRAM_ID
+        );
+
+        console.log('🪙 Token A:', tokenA.toString());
+        console.log('🪙 Token B:', tokenB.toString());
+
+        // Шаг 2: Создание токен аккаунтов
+        const tokenAccountA = await createAccount(
+            connection,
+            wallet,
+            tokenA,
+            wallet.publicKey
+        );
+
+        const tokenAccountB = await createAccount(
+            connection,
+            wallet,
+            tokenB,
+            wallet.publicKey
+        );
+
+        // Шаг 3: Минтинг токенов
+        console.log('💰 Минтинг тестовых токенов...');
+
+        await mintTo(
+            connection,
+            wallet,
+            tokenA,
+            tokenAccountA,
+            wallet,
+            1000 * 10**9 // 1000 токенов A
+        );
+
+        await mintTo(
+            connection,
+            wallet,
+            tokenB,
+            tokenAccountB,
+            wallet,
+            1000 * 10**6 // 1000 токенов B
+        );
+
+        console.log('✅ Тестовые токены созданы и заминчены');
+        console.log('📝 Сохраните эти адреса:');
+        console.log('   Token A:', tokenA.toString());
+        console.log('   Token B:', tokenB.toString());
+        console.log('   Token Account A:', tokenAccountA.toString());
+        console.log('   Token Account B:', tokenAccountB.toString());
+
+        // Примечание: Для создания полноценного AMM пула нужно больше кода
+        // Это базовая настройка для тестирования сканера
+
+    } catch (error) {
+        console.error('❌ Ошибка:', error);
+    }
+}
+
+// Альтернативный простой метод для тестирования
+async function findExistingPools() {
+    console.log('🔍 Поиск существующих пулов на devnet...');
+
+    const RAYDIUM_AMM_PROGRAM = new PublicKey('DRaya7Kj3aMWQSy19kSjvmuwq9docCHofyP9kanQGaav');
+
+    try {
+        const accounts = await connection.getProgramAccounts(RAYDIUM_AMM_PROGRAM, {
+            filters: [
+                { dataSize: 752 } // Размер AmmInfo структуры
+            ]
+        });
+
+        console.log(`📊 Найдено ${accounts.length} пулов Raydium AMM на devnet`);
+
+        accounts.slice(0, 5).forEach((account, i) => {
+            console.log(`   Пул ${i + 1}: ${account.pubkey.toString()}`);
+        });
+
+        return accounts;
+
+    } catch (error) {
+        console.error('❌ Ошибка поиска пулов:', error);
+        return [];
+    }
+}
+
+// Запускаем
+async function main() {
+    console.log('🚀 Настройка тестовой среды для арбитражного бота');
+
+    // Проверяем баланс
+    const balance = await connection.getBalance(wallet.publicKey);
+    console.log('💰 Баланс SOL:', balance / 10**9);
+
+    if (balance < 10**9) { // Меньше 1 SOL
+        console.log('⚠️ Низкий баланс! Получите devnet SOL:');
+        console.log('   solana airdrop 2');
+        return;
+    }
+
+    // Сначала проверим существующие пулы
+    const existingPools = await findExistingPools();
+
+    if (existingPools.length > 0) {
+        console.log('✅ На devnet есть пулы для тестирования');
+    } else {
+        console.log('⚠️ Пулов не найдено, создаем тестовые токены...');
+        await createTestPool();
+    }
+}
+
+main().catch(console.error);
+--- End File: /home/newvovi5/arbitrage-bot-rust/create-test-pool.js ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/Anchor.toml ---
+# arbitrage-bot-rust/Anchor.toml
+[toolchain]
+anchor_version = "0.31.0"
+solana_version = "2.3.0"
+
+[features]
+seeds = false
+skip-lint = false
+resolution = true
+
+[programs.localnet]
+arbitrage_executor = "HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9"
+
+[programs.devnet]
+arbitrage_executor = "HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9"
+
+[programs.mainnet]
+arbitrage_executor = "HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test-sbf"
+build = "anchor build"
+deploy-devnet = "anchor deploy --provider.cluster devnet"
+deploy-mainnet = "anchor deploy --provider.cluster mainnet-beta"
+
+[test]
+startup_wait = 10000
+
+[[test.genesis]]
+address = "44SMYSDatw9DU6amM4d3Yv9SkxzBRphtoftLP6ep5M7T"
+program = "./target/deploy/arbitrage_executor.so"
+
+[test.validator]
+bind_address = "0.0.0.0"
+url = "https://api.devnet.solana.com"
+--- End File: /home/newvovi5/arbitrage-bot-rust/Anchor.toml ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/programs/arbitrage-executor/src/lib.rs ---
+// programs/arbitrage-executor/src/lib.rs
+// Smart Contract "Executor" for Atomic Multi-Hop Swaps via CPI
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{
+    instruction::{AccountMeta, Instruction},
+    program::invoke,
+};
+use anchor_spl::token::{Token, TokenAccount, Mint};
+use anchor_lang::solana_program::pubkey;
+
+declare_id!("HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9");
+
+// ============================================================================
+// DEX PROGRAM IDS (MAINNET)
+// ============================================================================
+
+pub const RAYDIUM_AMM_V4: Pubkey = pubkey!("DRaya7Kj3aMWQSy19kSjvmuwq9docCHofyP9kanQGaav");
+pub const RAYDIUM_CPMM: Pubkey = pubkey!("DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb");
+pub const RAYDIUM_CLMM: Pubkey = pubkey!("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH");
+pub const METEORA_DLMM: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+
+// ============================================================================
+// TYPES & ENUMS
+// ============================================================================
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DexProtocol {
+    RaydiumAmmV4,
+    RaydiumCpmm,
+    RaydiumClmm,
+    MeteoraDlmm,
+}
+
+impl DexProtocol {
+    pub fn program_id(&self) -> Pubkey {
+        match self {
+            DexProtocol::RaydiumAmmV4 => RAYDIUM_AMM_V4,
+            DexProtocol::RaydiumCpmm => RAYDIUM_CPMM,
+            DexProtocol::RaydiumClmm => RAYDIUM_CLMM,
+            DexProtocol::MeteoraDlmm => METEORA_DLMM,
+        }
+    }
+}
+
+/// Single swap leg in multi-hop route
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct SwapLeg {
+    pub protocol: DexProtocol,
+    pub pool_id: Pubkey,
+    pub input_mint: Pubkey,
+    pub output_mint: Pubkey,
+    pub amount_in: u64,
+    pub minimum_amount_out: u64,
+    /// Number of accounts needed for CPI (extracted from remaining_accounts)
+    pub accounts_len: u8,
+}
+
+// ============================================================================
+// ERRORS
+// ============================================================================
+
+#[error_code]
+pub enum ArbitrageError {
+    #[msg("Insufficient profit - arbitrage not profitable")]
+    InsufficientProfit,
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+    #[msg("Invalid number of accounts provided")]
+    InvalidAccountsCount,
+    #[msg("Invalid DEX protocol specified")]
+    InvalidDexProtocol,
+    #[msg("Math overflow during calculation")]
+    MathOverflow,
+    #[msg("Unauthorized user")]
+    Unauthorized,
+    #[msg("Too many swap legs (max 5)")]
+    TooManyLegs,
+    #[msg("Insufficient balance")]
+    InsufficientBalance,
+    #[msg("CPI call failed")]
+    CpiCallFailed,
+    #[msg("Invalid token account")]
+    InvalidTokenAccount,
+}
+
+// ============================================================================
+// PROGRAM MODULE
+// ============================================================================
+
+#[program]
+pub mod arbitrage_executor {
+    use super::*;
+
+    /// Execute atomic multi-hop arbitrage swap
+    ///
+    /// # Parameters
+    /// - `swap_legs`: Sequence of swaps to execute
+    /// - `min_profit_lamports`: Minimum required profit in lamports
+    ///
+    /// # Logic
+    /// 1. Record initial balance
+    /// 2. Execute each swap via CPI to respective DEX
+    /// 3. Verify final balance >= initial + min_profit
+    /// 4. If profit insufficient - transaction reverts
+    pub fn execute_arbitrage<'a, 'b, 'c, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, ExecuteArbitrage<'info>>,
+        swap_legs: Vec<SwapLeg>,
+        min_profit_lamports: u64,
+    ) -> Result<()>
+    where
+        'c: 'info,
+    {
+        // Validate swap legs count (max 5 to limit compute units)
+        require!(
+            !swap_legs.is_empty() && swap_legs.len() <= 5,
+            ArbitrageError::TooManyLegs
+        );
+
+        msg!(
+            "🚀 Starting arbitrage: {} legs, min profit {} lamports",
+            swap_legs.len(),
+            min_profit_lamports
+        );
+
+        // Record initial balance
+        let initial_balance = ctx.accounts.user_token_account.amount;
+        msg!("💰 Initial balance: {} lamports", initial_balance);
+
+        // Validate sufficient balance
+        require!(
+            initial_balance >= swap_legs[0].amount_in,
+            ArbitrageError::InsufficientBalance
+        );
+
+        // Execute each swap leg
+        let mut account_cursor = 0_usize;
+
+        for (idx, leg) in swap_legs.iter().enumerate() {
+            msg!(
+                "📊 Leg {}/{}: {:?} on pool {}",
+                idx + 1,
+                swap_legs.len(),
+                leg.protocol,
+                leg.pool_id
+            );
+
+            // Extract accounts for current leg from remaining_accounts
+            let accounts_end = account_cursor
+                .checked_add(leg.accounts_len as usize)
+                .ok_or(ArbitrageError::MathOverflow)?;
+            require!(
+            accounts_end <= ctx.remaining_accounts.len(),
+            ArbitrageError::InvalidAccountsCount
+        );
+
+            let leg_accounts = &ctx.remaining_accounts[account_cursor..accounts_end];
+
+            // Execute swap via CPI
+            execute_swap_cpi(leg, leg_accounts, &ctx.accounts.user)?;
+
+            account_cursor = accounts_end;
+
+            // Reload balance after intermediate step
+            if idx < swap_legs.len() - 1 {
+                ctx.accounts.user_token_account.reload()?;
+                msg!("   Intermediate balance: {}", ctx.accounts.user_token_account.amount);
+            }
+        }
+
+        // Final profitability check
+        ctx.accounts.user_token_account.reload()?;
+        let final_balance = ctx.accounts.user_token_account.amount;
+
+        msg!("💎 Final balance: {} lamports", final_balance);
+
+        // Calculate net profit
+        let profit = final_balance
+            .checked_sub(initial_balance)
+            .ok_or(ArbitrageError::MathOverflow)?;
+
+        msg!(
+            "📈 Profit: {} lamports ({:.4}%)",
+            profit,
+            (profit as f64 / initial_balance as f64) * 100.0
+        );
+
+        // Verify minimum profit (CRITICAL: reverts if insufficient)
+        require!(
+            profit >= min_profit_lamports,
+            ArbitrageError::InsufficientProfit
+        );
+
+        msg!("✅ ARBITRAGE SUCCESSFUL");
+
+        // Emit event for monitoring
+        emit!(ArbitrageExecutedEvent {
+            user: ctx.accounts.user.key(),
+            initial_balance,
+            final_balance,
+            profit,
+            legs_count: swap_legs.len() as u8,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// ACCOUNT STRUCTURES
+// ============================================================================
+
+#[derive(Accounts)]
+pub struct ExecuteArbitrage<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = user_token_account.owner == user.key() @ ArbitrageError::Unauthorized
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        constraint = user_token_account.mint == token_mint.key() @ ArbitrageError::InvalidTokenAccount
+    )]
+    pub token_mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+#[event]
+pub struct ArbitrageExecutedEvent {
+    pub user: Pubkey,
+    pub initial_balance: u64,
+    pub final_balance: u64,
+    pub profit: u64,
+    pub legs_count: u8,
+    pub timestamp: i64,
+}
+
+// ============================================================================
+// CPI HELPER FUNCTIONS
+// ============================================================================
+
+/// Execute swap via CPI to DEX
+fn execute_swap_cpi<'info>(
+    leg: &SwapLeg,
+    accounts: &'info [AccountInfo<'info>],
+    user: &Signer<'info>,
+) -> Result<()> {
+    match leg.protocol {
+        DexProtocol::RaydiumAmmV4 => raydium_amm_swap(leg, accounts, user),
+        DexProtocol::RaydiumCpmm => raydium_cpmm_swap(leg, accounts, user),
+        DexProtocol::RaydiumClmm => raydium_clmm_swap(leg, accounts, user),
+        DexProtocol::MeteoraDlmm => meteora_dlmm_swap(leg, accounts, user),
+    }
+}
+
+/// Raydium AMM V4 swap_base_in CPI
+fn raydium_amm_swap<'info>(
+    leg: &SwapLeg,
+    accounts: &'info [AccountInfo<'info>],
+    _user: &Signer<'info>,
+) -> Result<()> {
+    require!(accounts.len() == 18, ArbitrageError::InvalidAccountsCount);
+
+    // Raydium AMM V4 swap_base_in discriminator: 0x09
+    let mut data = vec![0x09];
+    data.extend_from_slice(&leg.amount_in.to_le_bytes());
+    data.extend_from_slice(&leg.minimum_amount_out.to_le_bytes());
+
+    let account_metas: Vec<AccountMeta> = accounts
+        .iter()
+        .map(|acc| AccountMeta {
+            pubkey: *acc.key,
+            is_signer: acc.is_signer,
+            is_writable: acc.is_writable,
+        })
+        .collect();
+
+    let ix = Instruction {
+        program_id: RAYDIUM_AMM_V4,
+        accounts: account_metas,
+        data,
+    };
+
+    invoke(&ix, accounts).map_err(|_| error!(ArbitrageError::CpiCallFailed))?;
+
+    msg!("   ✅ Raydium AMM swap executed");
+    Ok(())
+}
+
+/// Raydium CPMM swap CPI
+fn raydium_cpmm_swap<'info>(
+    leg: &SwapLeg,
+    accounts: &'info [AccountInfo<'info>],
+    _user: &Signer<'info>,
+) -> Result<()> {
+    require!(accounts.len() >= 10, ArbitrageError::InvalidAccountsCount);
+
+    // CPMM swap discriminator (verify from SDK documentation)
+    let mut data = vec![0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+    data.extend_from_slice(&leg.amount_in.to_le_bytes());
+    data.extend_from_slice(&leg.minimum_amount_out.to_le_bytes());
+
+    let account_metas: Vec<AccountMeta> = accounts
+        .iter()
+        .map(|acc| AccountMeta {
+            pubkey: *acc.key,
+            is_signer: acc.is_signer,
+            is_writable: acc.is_writable,
+        })
+        .collect();
+
+    let ix = Instruction {
+        program_id: RAYDIUM_CPMM,
+        accounts: account_metas,
+        data,
+    };
+
+    invoke(&ix, accounts).map_err(|_| error!(ArbitrageError::CpiCallFailed))?;
+
+    msg!("   ✅ Raydium CPMM swap executed");
+    Ok(())
+}
+
+/// Raydium CLMM swap CPI
+fn raydium_clmm_swap<'info>(
+    leg: &SwapLeg,
+    accounts: &'info [AccountInfo<'info>],
+    _user: &Signer<'info>,
+) -> Result<()> {
+    require!(accounts.len() >= 12, ArbitrageError::InvalidAccountsCount);
+
+    // CLMM swap discriminator
+    let mut data = vec![0x7c, 0x1c, 0x97, 0xce, 0x3b, 0x8f, 0x8d, 0x6e];
+    data.extend_from_slice(&leg.amount_in.to_le_bytes());
+    data.extend_from_slice(&leg.minimum_amount_out.to_le_bytes());
+    data.extend_from_slice(&(160 as u128).to_le_bytes()); // sqrt_price_limit
+
+    let account_metas: Vec<AccountMeta> = accounts
+        .iter()
+        .map(|acc| AccountMeta {
+            pubkey: *acc.key,
+            is_signer: acc.is_signer,
+            is_writable: acc.is_writable,
+        })
+        .collect();
+
+    let ix = Instruction {
+        program_id: RAYDIUM_CLMM,
+        accounts: account_metas,
+        data,
+    };
+
+    invoke(&ix, accounts).map_err(|_| error!(ArbitrageError::CpiCallFailed))?;
+
+    msg!("   ✅ Raydium CLMM swap executed");
+    Ok(())
+}
+
+/// Meteora DLMM swap CPI
+fn meteora_dlmm_swap<'info>(
+    leg: &SwapLeg,
+    accounts: &'info [AccountInfo<'info>],
+    _user: &Signer<'info>,
+) -> Result<()> {
+    require!(accounts.len() >= 10, ArbitrageError::InvalidAccountsCount);
+
+    // Meteora DLMM swap discriminator
+    let mut data = vec![0x13, 0x98, 0xa2, 0x5f, 0x5e, 0x8f, 0x2d, 0x7c];
+    data.extend_from_slice(&leg.amount_in.to_le_bytes());
+    data.extend_from_slice(&leg.minimum_amount_out.to_le_bytes());
+
+    let account_metas: Vec<AccountMeta> = accounts
+        .iter()
+        .map(|acc| AccountMeta {
+            pubkey: *acc.key,
+            is_signer: acc.is_signer,
+            is_writable: acc.is_writable,
+        })
+        .collect();
+
+    let ix = Instruction {
+        program_id: METEORA_DLMM,
+        accounts: account_metas,
+        data,
+    };
+
+    invoke(&ix, accounts).map_err(|_| error!(ArbitrageError::CpiCallFailed))?;
+
+    msg!("   ✅ Meteora DLMM swap executed");
+    Ok(())
+}
+--- End File: /home/newvovi5/arbitrage-bot-rust/programs/arbitrage-executor/src/lib.rs ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/programs/arbitrage-executor/Cargo.toml ---
+# programs/arbitrage-executor/Cargo.toml
+[package]
+name = "arbitrage-executor"
+version = "0.1.0"
+description = "Solana Arbitrage Executor Smart Contract"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "arbitrage_executor"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+custom-heap = []
+custom-panic = []
+anchor-debug = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
+anchor-spl = { workspace = true }
+
+
+--- End File: /home/newvovi5/arbitrage-bot-rust/programs/arbitrage-executor/Cargo.toml ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/programs/arbitrage-executor/Xargo.toml ---
+# programs/arbitrage-executor/Xargo.toml
+# Конфигурация кросс-компиляции для BPF
+
+[target.bpfel-unknown-unknown.dependencies.std]
+features = []
+
+[target.bpfel-unknown-unknown.dependencies.core]
+features = []
+
+[target.bpfel-unknown-unknown.dependencies.compiler_builtins]
+features = []
+--- End File: /home/newvovi5/arbitrage-bot-rust/programs/arbitrage-executor/Xargo.toml ---
+
+--- File: /home/newvovi5/arbitrage-bot-rust/.env ---
+# Существующие переменные
+SOLANA_RPC_URL=https://api.devnet.solana.com
+SOLANA_WS_URL=wss://api.devnet.solana.com
+WALLET_PATH=~/.config/solana/id.json
+ARBITRAGE_EXECUTOR_PROGRAM_ID=HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9
+MIN_PROFIT_LAMPORTS=1000
+MIN_PROFIT_BPS=10
+MAX_SLIPPAGE_BPS=500
+INITIAL_AMOUNT_SOL=0.01
+LOG_LEVEL=info
+TELEMETRY_ENABLED=false
+
+# НОВАЯ ПЕРЕМЕННАЯ ДЛЯ ПОДДЕРЖКИ КЛАСТЕРОВ
+SOLANA_CLUSTER=devnet
+--- End File: /home/newvovi5/arbitrage-bot-rust/.env ---
+

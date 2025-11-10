@@ -1,0 +1,18 @@
+/target/
+Cargo.lock
+/bot/scripts/
+/.cargo/
+/config/
+
+# Solana/Wallet secrets
+*.json
+id.json
+.secret
+
+# Environment variables
+.env
+
+# Logs and temporary files
+*.log
+/log/
+/logs/

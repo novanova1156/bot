@@ -1,0 +1,42 @@
+# arbitrage-bot-rust/Anchor.toml
+[toolchain]
+anchor_version = "0.31.0"
+solana_version = "2.3.0"
+
+[features]
+seeds = false
+skip-lint = false
+resolution = true
+
+[programs.localnet]
+arbitrage_executor = "HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9"
+
+[programs.devnet]
+arbitrage_executor = "HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9"
+
+[programs.mainnet]
+arbitrage_executor = "HXccYBQu47LExrec1CAUBybYsXQL2pkEEdTaSD9emRY9"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test-sbf"
+build = "anchor build"
+deploy-devnet = "anchor deploy --provider.cluster devnet"
+deploy-mainnet = "anchor deploy --provider.cluster mainnet-beta"
+
+[test]
+startup_wait = 10000
+
+[[test.genesis]]
+address = "44SMYSDatw9DU6amM4d3Yv9SkxzBRphtoftLP6ep5M7T"
+program = "./target/deploy/arbitrage_executor.so"
+
+[test.validator]
+bind_address = "0.0.0.0"
+url = "https://api.devnet.solana.com"
