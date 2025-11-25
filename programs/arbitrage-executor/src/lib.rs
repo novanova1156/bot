@@ -3,10 +3,14 @@
 #![allow(deprecated)]
 
 use anchor_lang::prelude::*;
-use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
-    program::invoke,
+    program::{invoke},
+    pubkey::Pubkey,
+    msg,
+
 };
 use anchor_spl::token::{Token, TokenAccount, Mint};
 use anchor_lang::solana_program::pubkey;
@@ -261,7 +265,7 @@ fn execute_swap_cpi<'info>(
         DexProtocol::RaydiumAmmV4 => raydium_amm_swap(leg, accounts, user),
         DexProtocol::RaydiumCpmm => raydium_cpmm_swap(leg, accounts, user),
         DexProtocol::RaydiumClmm => raydium_clmm_swap(leg, accounts, user),
-        DexProtocol::MeteoraDlmm => meteora_dlmm_swap(leg, accounts, user),
+        DexProtocol::MeteoraDlmm => meteora_dlmm_swap(leg, accounts, user), // Ошибка E0425 здесь
     }
 }
 
@@ -340,23 +344,19 @@ fn raydium_clmm_swap<'info>(
     accounts: &'info [AccountInfo<'info>],
     _user: &Signer<'info>,
 ) -> Result<()> {
-    require!(accounts.len() >= 12, ArbitrageError::InvalidAccountsCount);
+    require!(accounts.len() >= 13, ArbitrageError::InvalidAccountsCount);
 
-    // НОВОЕ ИСПРАВЛЕНИЕ: Используем 8-байтовый Anchor-дискриминатор для "swap" (sha256("global:swap")[..8])
-    // Это обходит ошибку InstructionFallbackNotFound (101) на Anchor-программах Devnet.
-    let mut data: Vec<u8> = vec![0x5a, 0xc2, 0x44, 0xa8, 0x39, 0xf9, 0x97, 0xce];
+    // ПРАВИЛЬНЫЙ дискриминатор для swap_v2 (sha256("global:swap_v2")[..8])
+    // УДАЛЕНЫ ЛИШНИЕ СИМВОЛЫ **
+    let mut data: Vec<u8> = vec![0xf3, 0x0c, 0x03, 0x33, 0x8f, 0x93, 0x18, 0x39];
 
-    // Далее добавляем параметры: amount_in, minimum_amount_out, sqrt_price_limit, is_base_in
-    data.extend_from_slice(&leg.amount_in.to_le_bytes());
-    data.extend_from_slice(&leg.minimum_amount_out.to_le_bytes());
+    // Параметры для swap_v2
+    data.extend_from_slice(&leg.amount_in.to_le_bytes());          // amount: u64
+    data.extend_from_slice(&leg.minimum_amount_out.to_le_bytes());  // other_amount_threshold: u64
+    data.extend_from_slice(&(0_u128).to_le_bytes());              // sqrt_price_limit_x64: u128 (0 = no limit)
+    // data.extend_from_slice(&(1_u8).to_le_bytes());                // is_base_input: bool (true)
 
-    // 1. sqrt_price_limit (u128): u128::MAX
-    const MAX_SQRT_PRICE_LIMIT: u128 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF;
-    data.extend_from_slice(&MAX_SQRT_PRICE_LIMIT.to_le_bytes());
-
-    // 2. is_base_in (bool, 1 байт): 1 (true)
-    data.extend_from_slice(&(1 as u8).to_le_bytes());
-
+    // УДАЛЕНЫ ЛИШНИЕ СИМВОЛЫ **
     let account_metas: Vec<AccountMeta> = accounts
         .iter()
         .map(|acc| AccountMeta {
@@ -374,10 +374,11 @@ fn raydium_clmm_swap<'info>(
 
     invoke(&ix, accounts).map_err(|_| error!(ArbitrageError::CpiCallFailed))?;
 
-    msg!("   ✅ Raydium CLMM swap executed (using Anchor discriminator)");
+    msg!("   ✅ Raydium CLMM swap_v2 executed");
     Ok(())
 }
 
+// **(3) ДОБАВЛЕНА ОТСУТСТВУЮЩАЯ ФУНКЦИЯ meteora_dlmm_swap (ИСПРАВЛЕНИЕ E0425)**
 /// Meteora DLMM swap CPI
 fn meteora_dlmm_swap<'info>(
     leg: &SwapLeg,

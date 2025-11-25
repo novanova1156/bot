@@ -29,6 +29,11 @@ use crate::{
 pub const RAYDIUM_AMM_V4: Pubkey = pubkey!("DRaya7Kj3aMWQSy19kSjvmuwq9docCHofyP9kanQGaav");
 pub const RAYDIUM_CPMM: Pubkey = pubkey!("DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb");
 pub const RAYDIUM_CLMM: Pubkey = pubkey!("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH");
+
+// SPL Program IDs для CLMM
+pub const SPL_TOKEN_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const SPL_TOKEN_2022_ID: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+pub const SPL_MEMO_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 // ============================================================================
 
 pub struct TransactionBuilder {
@@ -79,7 +84,7 @@ impl TransactionBuilder {
         info!("🔨 Строим транзакцию: {} свопов", opp.legs.len());
 
         /* ---------- mock-режим для devnet-fallback ---------- */
-        let is_test_environment = self.config.rpc.url.contains("devnet")
+        let is_test_environment = self.config.rpc.url.contains("devnet") // Используем "devnet" в нижнем регистре
             && opp
             .legs
             .iter()
@@ -170,9 +175,8 @@ impl TransactionBuilder {
     ) -> Result<(Vec<AccountMeta>, ProgramSwapLeg)> {
         match leg.protocol {
             DexProtocol::RaydiumAmmV4 => self.raydium_amm_v4_accounts(leg).await,
-            DexProtocol::RaydiumCpmm | DexProtocol::RaydiumClmm => {
-                self.raydium_cpmm_clmm_accounts(leg).await
-            }
+            DexProtocol::RaydiumCpmm => self.raydium_cpmm_accounts(leg).await,
+            DexProtocol::RaydiumClmm => self.get_raydium_clmm_accounts(leg).await,
             _ => unimplemented!("DEX {:?} не реализован", leg.protocol),
         }
     }
@@ -183,18 +187,19 @@ impl TransactionBuilder {
     ) -> Result<(Vec<AccountMeta>, ProgramSwapLeg)> {
         let data = self.rpc_client.get_account(&leg.pool_id)?.data;
         let amm  = AmmInfo::try_from_slice(&data).context("decode AmmInfo")?;
+
+        // ID программы DEX *не* включается в список аккаунтов для CPI
         let dex_program_id = self.dex_program_id_for_protocol(leg.protocol);
 
         let user_src = associated_token::get_associated_token_address(&self.keypair.pubkey(), &leg.input_mint);
         let user_dst = associated_token::get_associated_token_address(&self.keypair.pubkey(), &leg.output_mint);
 
-        // ВАЖНО: Raydium AMM V4 требует 18 аккаунтов.
-        // Временный, неполный список для отладки V4 (9 аккаунтов)
+        // Raydium AMM V4 требует 18 аккаунтов.
         let accts = vec![
-            // 1. DEX Program ID (ДЛЯ CPI)
+            // ИСПРАВЛЕНО: ВОЗВРАЩАЕМ Program ID. Это 1-й аккаунт для SC (для invoke).
             AccountMeta::new_readonly(dex_program_id, false),
 
-            // 8 стандартных аккаунтов, которые мы знаем
+            // 8 стандартных аккаунтов, которые мы знаем (18 всего)
             AccountMeta::new(leg.pool_id, false),
             AccountMeta::new_readonly(amm.market_id, false),
             AccountMeta::new(amm.base_vault, false),
@@ -203,6 +208,7 @@ impl TransactionBuilder {
             AccountMeta::new(user_dst, false),
             AccountMeta::new_readonly(self.keypair.pubkey(), true),
             AccountMeta::new_readonly(token::ID, false),
+            // ... здесь не хватает 10 аккаунтов для V4, но это отдельная проблема
         ];
 
         let pl = ProgramSwapLeg {
@@ -212,82 +218,52 @@ impl TransactionBuilder {
             output_mint:        leg.output_mint,
             amount_in:          leg.amount_in,
             minimum_amount_out: leg.minimum_amount_out,
-            accounts_len:       accts.len() as u8,
+            accounts_len:       accts.len() as u8, // 9 аккаунтов (DEX ID + 8)
         };
 
         Ok((accts, pl))
     }
 
-    // ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ CPMM/CLMM (10 или 12 аккаунтов)
-    async fn raydium_cpmm_clmm_accounts(
+    async fn raydium_cpmm_accounts(
         &self,
         leg: &SwapLeg,
     ) -> Result<(Vec<AccountMeta>, ProgramSwapLeg)> {
 
         let data = self.rpc_client.get_account(&leg.pool_id)?.data;
 
-        // Получаем информацию о пуле
-        let (authority, vault_a, vault_b, mint_a) = match leg.protocol {
-            DexProtocol::RaydiumCpmm => {
-                let pool_info = CpmmPoolInfo::try_from_slice(&data)
-                    .with_context(|| format!("Не удалось декодировать CpmmPoolInfo для пула {}", leg.pool_id))?;
-                (pool_info.authority, pool_info.vault_a, pool_info.vault_b, pool_info.mint_a)
-            }
-            DexProtocol::RaydiumClmm => {
-                let pool_info = ClmmPoolInfo::try_from_slice(&data)
-                    .with_context(|| format!("Не удалось декодировать ClmmPoolInfo для пула {}", leg.pool_id))?;
+        let pool_info = CpmmPoolInfo::try_from_slice(&data)
+            .with_context(|| format!("Не удалось декодировать CpmmPoolInfo для пула {}", leg.pool_id))?;
 
-                warn!("⚠️ Внимание: Парсинг CLMM реализован с минимальными, возможно, неточными офсетами. Требуется верификация.");
-                (pool_info.authority, pool_info.vault_a, pool_info.vault_b, pool_info.mint_a)
-            }
-            _ => {
-                anyhow::bail!("Неподдерживаемый протокол в raydium_cpmm_clmm_accounts");
-            }
-        };
+        let (authority, vault_a, vault_b, mint_a) =
+            (pool_info.authority, pool_info.vault_a, pool_info.vault_b, pool_info.mint_a);
 
-        // --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #1: Динамический выбор Vault IN/OUT ---
+
         let (token_vault_in, token_vault_out) = if leg.input_mint == mint_a {
-            // Swap A -> B: Vault A - вход, Vault B - выход
             (vault_a, vault_b)
         } else {
-            // Swap B -> A: Vault B - вход, Vault A - выход
             (vault_b, vault_a)
         };
-        // ------------------------------------------------------------------
 
         let dex_program_id = self.dex_program_id_for_protocol(leg.protocol);
         let user_src = associated_token::get_associated_token_address(&self.keypair.pubkey(), &leg.input_mint);
         let user_dst = associated_token::get_associated_token_address(&self.keypair.pubkey(), &leg.output_mint);
 
-        // 1. 10 базовых аккаунтов (Raydium Program ID + 9 CPI accounts)
-        let mut accts = vec![
-            // 1. DEX Program ID (Включаем, чтобы удовлетворить проверку SC)
+        // 10 аккаунтов для CPMM (DEX ID + 9)
+        let accts = vec![
+            // ИСПРАВЛЕНО: ВОЗВРАЩАЕМ Program ID. Это 1-й аккаунт для SC (для invoke).
             AccountMeta::new_readonly(dex_program_id, false),
 
-            // 9 стандартных Raydium CPI аккаунтов
-            AccountMeta::new(leg.pool_id, false),                    // 2. Пул/Стейт (Mut)
-            AccountMeta::new_readonly(authority, false),             // 3. Authority пула (Readonly)
-            AccountMeta::new(token_vault_in, false),                 // 4. Vault IN (Mut)
-            AccountMeta::new(token_vault_out, false),                // 5. Vault OUT (Mut)
-            AccountMeta::new(user_src, false),                       // 6. ATA From (Mut)
-            AccountMeta::new(user_dst, false),                       // 7. ATA To (Mut)
-            AccountMeta::new_readonly(self.keypair.pubkey(), true),  // 8. Signer/Инициатор (Readonly/Signer)
-            AccountMeta::new_readonly(token::ID, false),             // 9. Token Program (Readonly)
-            AccountMeta::new_readonly(sysvar::clock::ID, false),     // 10. Sysvar Clock (Readonly)
+            // 9 стандартных Raydium CPI аккаунтов (начиная со 2-го аккаунта в списке)
+            AccountMeta::new(leg.pool_id, false),                    // 1. Пул/Стейт (Mut)
+            AccountMeta::new_readonly(authority, false),             // 2. Authority пула (Readonly)
+            AccountMeta::new(token_vault_in, false),                 // 3. Vault IN (Mut)
+            AccountMeta::new(token_vault_out, false),                // 4. Vault OUT (Mut)
+            AccountMeta::new(user_src, false),                       // 5. ATA From (Mut)
+            AccountMeta::new(user_dst, false),                       // 6. ATA To (Mut)
+            AccountMeta::new_readonly(self.keypair.pubkey(), true),  // 7. Signer/Инициатор (Readonly/Signer)
+            AccountMeta::new_readonly(token::ID, false),             // 8. Token Program (Readonly)
+            AccountMeta::new_readonly(sysvar::clock::ID, false),     // 9. Sysvar Clock (Readonly)
         ];
-
-        // --- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #2: Добавляем placeholder аккаунты для CLMM (12 аккаунтов) ---
-        if leg.protocol == DexProtocol::RaydiumClmm {
-            // Raydium CLMM (и большинство CLMM/DLMM) требуют 2 дополнительных аккаунта (тик-массивы).
-            // Добавляем 2 placeholder аккаунта, чтобы пройти проверку SC (accounts.len() >= 12).
-            // Внимание: Для реального исполнения эти адреса должны быть правильно вычислены!
-
-            // 11. Tick Array 0 (Mut)
-            accts.push(AccountMeta::new(Pubkey::default(), false));
-            // 12. Tick Array 1 (Mut)
-            accts.push(AccountMeta::new(Pubkey::default(), false));
-        }
-        // -----------------------------------------------------------------------------
 
         let accounts_len = accts.len() as u8;
 
@@ -298,12 +274,111 @@ impl TransactionBuilder {
             output_mint:        leg.output_mint,
             amount_in:          leg.amount_in,
             minimum_amount_out: leg.minimum_amount_out,
-            accounts_len:       accounts_len, // 10 для CPMM, 12 для CLMM
+            accounts_len:       accounts_len, // Теперь 10 для CPMM (1+9)
         };
 
         Ok((accts, pl))
     }
 
+    async fn get_raydium_clmm_accounts(
+        &self,
+        leg: &SwapLeg,
+    ) -> Result<(Vec<AccountMeta>, ProgramSwapLeg)> {
+        debug!("📊 Получение аккаунтов для Raydium CLMM пула: {}", leg.pool_id);
+
+        let pool_account = self.rpc_client.get_account(&leg.pool_id)?;
+        let pool_data = &pool_account.data[8..]; // Пропускаем Anchor discriminator
+
+        let amm_config = Pubkey::new_from_array(pool_data[1..33].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь amm_config из pool data")
+        })?);
+        let authority = Pubkey::new_from_array(pool_data[33..65].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь authority из pool data")
+        })?);
+        let token_mint_0 = Pubkey::new_from_array(pool_data[65..97].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь token_mint_0 из pool data")
+        })?);
+        let token_mint_1 = Pubkey::new_from_array(pool_data[97..129].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь token_mint_1 из pool data")
+        })?);
+        let token_vault_0 = Pubkey::new_from_array(pool_data[129..161].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь token_vault_0 из pool data")
+        })?);
+        let token_vault_1 = Pubkey::new_from_array(pool_data[161..193].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь token_vault_1 из pool data")
+        })?);
+        let observation_key = Pubkey::new_from_array(pool_data[193..225].try_into().map_err(|_| {
+            anyhow::anyhow!("Не удалось извлечь observation_key из pool data")
+        })?);
+
+        let (input_vault, output_vault) = if leg.input_mint == token_mint_0 {
+            (token_vault_0, token_vault_1)
+        } else {
+            (token_vault_1, token_vault_0)
+        };
+
+        let user_input_ata = associated_token::get_associated_token_address(
+            &self.keypair.pubkey(),
+            &leg.input_mint
+        );
+        let user_output_ata = associated_token::get_associated_token_address(
+            &self.keypair.pubkey(),
+            &leg.output_mint
+        );
+
+        let dex_program_id = self.dex_program_id_for_protocol(leg.protocol);
+
+
+        // 13 фиксированных аккаунтов для CLMM swap_v2 (согласно официальной структуре)
+        let accounts = vec![
+            // ИСПРАВЛЕНО: ВОЗВРАЩАЕМ Program ID. Это 1-й аккаунт для SC (для invoke).
+            AccountMeta::new_readonly(dex_program_id, false),
+
+            // 0. payer (signer) - Это наш Payer (Keypair)
+            AccountMeta::new(self.keypair.pubkey(), true),
+            // 1. amm_config
+            AccountMeta::new_readonly(amm_config, false),
+            // 2. pool_state
+            AccountMeta::new(leg.pool_id, false),
+            // 3. input_token_account (ATA пользователя)
+            AccountMeta::new(user_input_ata, false),
+            // 4. output_token_account (ATA пользователя)
+            AccountMeta::new(user_output_ata, false),
+            // 5. input_vault
+            AccountMeta::new(input_vault, false),
+            // 6. output_vault
+            AccountMeta::new(output_vault, false),
+            // 7. observation_state
+            AccountMeta::new(observation_key, false),
+            // 8. token_program (Используем константу)
+            AccountMeta::new_readonly(SPL_TOKEN_ID, false),
+            // 9. token_program2022 (Используем константу)
+            AccountMeta::new_readonly(SPL_TOKEN_2022_ID, false),
+            // 10. memo_program (Используем константу)
+            AccountMeta::new_readonly(SPL_MEMO_ID, false),
+            // 11. input_vault_mint
+            AccountMeta::new_readonly(leg.input_mint, false),
+            // 12. output_vault_mint
+            AccountMeta::new_readonly(leg.output_mint, false),
+
+            // Remaining accounts: tick arrays (TODO: добавить динамически на основе swap размера)
+            // Для простоты пока не добавляем; в продакшене нужно вычислить и добавить 1-3 tick array PDA
+        ];
+
+        debug!("   ✅ Подготовлено {} аккаунтов для Raydium CLMM (14 fixed + tick arrays TBD)", accounts.len());
+
+        let program_leg = ProgramSwapLeg {
+            protocol: leg.protocol as u8,
+            pool_id: leg.pool_id,
+            input_mint: leg.input_mint,
+            output_mint: leg.output_mint,
+            amount_in: leg.amount_in,
+            minimum_amount_out: leg.minimum_amount_out,
+            accounts_len: accounts.len() as u8, // Теперь 14 (1 + 13)
+        };
+
+        Ok((accounts, program_leg))
+    }
 
     /* ---------- execute-ix ---------- */
     fn make_execute_ix(
